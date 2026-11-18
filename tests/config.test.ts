@@ -11,7 +11,24 @@ import {
   parseConfigText,
   resolveConfigFilePath,
 } from "../src/config.js"
-import { MAX_REFERENCED_FILE_BYTES, DEFAULT_PERMISSION_NOTIFICATION_DELAY_MS, notificationKinds } from "../src/types.js"
+import {
+  MAX_REFERENCED_FILE_BYTES,
+  DEFAULT_PERMISSION_NOTIFICATION_DELAY_MS,
+  DEFAULT_TIMEOUT_MS,
+  notificationKinds,
+  type GotifyPluginConfig,
+  type NtfyPluginConfig,
+  type PluginConfig,
+  type WebPushPluginConfig,
+  type WebPushSettings,
+} from "../src/types.js"
+
+// A fixed VAPID keypair for deterministic tests, generated once with
+// `npx web-push generate-vapid-keys --json`. Test-only, never shipped.
+const TEST_VAPID_PUBLIC_KEY = "BCbA4oS2TxtmqASPvdeQyFUoNnqMtb3uzmjouUBAkfDWsb0yR84iDS3Mrs7Pn2wconyNd_PkMKaItjHEOHv_ezs"
+const TEST_VAPID_PRIVATE_KEY = "5K7qXP8V_-j1U-F8puy98fO-8q_s9m9xIdo1n4jsKpg"
+// A different VAPID private key that does not match TEST_VAPID_PUBLIC_KEY.
+const OTHER_VAPID_PRIVATE_KEY = "NsmwYDJcVabclF7_sx4E08qqOj7OwtOsYulrsX0xH1Q"
 
 const tempDirs: string[] = []
 
@@ -31,7 +48,7 @@ afterEach(async () => {
 async function writeConfig(text: string, dir: string): Promise<string> {
   const dirName = join(dir, "opencode")
   await mkdir(dirName, { recursive: true })
-  const filePath = join(dirName, "notification-ntfy-with-questions.json")
+  const filePath = join(dirName, "notification-notifications-with-questions.json")
   await writeFile(filePath, text, "utf8")
   return filePath
 }
@@ -45,16 +62,54 @@ async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
   }
   throw new Error("expected the promise to reject")
 }
+/** Captures the error thrown by a synchronous function for message assertions. */
+function thrownErrorOf(fn: () => unknown): Error {
+  try {
+    fn()
+  } catch (error) {
+    return error as Error
+  }
+  throw new Error("expected the function to throw")
+}
+/** Narrows a validated config to the ntfy variant these tests assert on. */
+function asNtfy(config: PluginConfig): NtfyPluginConfig {
+  if (config.transport !== "ntfy") throw new Error("expected an active ntfy Transport")
+  return config
+}
+/** Narrows a validated config to the gotify variant these tests assert on. */
+function asGotify(config: PluginConfig): GotifyPluginConfig {
+  if (config.transport !== "gotify") throw new Error("expected an active gotify Transport")
+  return config
+}
+/** Narrows a validated config to the webpush variant these tests assert on. */
+function asWebpush(config: PluginConfig): WebPushPluginConfig {
+  if (config.transport !== "webpush") throw new Error("expected an active webpush Transport")
+  return config
+}
+
+/** A raw valid webpush transport config with overridable webpush fields. */
+function webpushConfig(overrides: Partial<WebPushSettings> = {}): Record<string, unknown> {
+  return {
+    transport: "webpush",
+    webpush: {
+      subject: "mailto:push@example.com",
+      publicKey: TEST_VAPID_PUBLIC_KEY,
+      privateKey: TEST_VAPID_PRIVATE_KEY,
+      storePath: "/tmp/opencode/subscriptions.json",
+      ...overrides,
+    },
+  }
+}
 
 describe("config file path", () => {
   it("uses $XDG_CONFIG_HOME when set", () => {
     expect(resolveConfigFilePath({ XDG_CONFIG_HOME: "/custom/config" }, "/home/tester")).toBe(
-      join("/custom/config", "opencode", "notification-ntfy-with-questions.json"),
+      join("/custom/config", "opencode", "notification-notifications-with-questions.json"),
     )
   })
 
   it("falls back to ~/.config when XDG_CONFIG_HOME is unset or empty", () => {
-    const expected = join("/home/tester", ".config", "opencode", "notification-ntfy-with-questions.json")
+    const expected = join("/home/tester", ".config", "opencode", "notification-notifications-with-questions.json")
     expect(resolveConfigFilePath({}, "/home/tester")).toBe(expected)
     expect(resolveConfigFilePath({ XDG_CONFIG_HOME: "" }, "/home/tester")).toBe(expected)
   })
@@ -63,7 +118,7 @@ describe("config file path", () => {
 describe("loadConfigFile", () => {
   it("fails with an actionable error when the config file is missing", async () => {
     const dir = await makeDir()
-    const missing = join(dir, "opencode", "notification-ntfy-with-questions.json")
+    const missing = join(dir, "opencode", "notification-notifications-with-questions.json")
     const error = await rejectionOf(loadConfigFile(missing))
     expect(error).toBeInstanceOf(ConfigError)
     expect((error as ConfigError).code).toBe("config.unreadable")
@@ -74,7 +129,7 @@ describe("loadConfigFile", () => {
   it("loads a minimal config with defaults applied", async () => {
     const dir = await makeDir()
     const filePath = await writeConfig(JSON.stringify({ ntfy: { topic: "my-topic" } }), dir)
-    const config = await loadConfigFile(filePath)
+    const config = asNtfy(await loadConfigFile(filePath))
     expect(config.enabled).toBe(true)
     for (const kind of notificationKinds) expect(config.events[kind]).toBe(true)
     expect(config.suppressSubagents).toEqual({ "session.idle": true, "session.error": true })
@@ -114,7 +169,7 @@ describe("validation", () => {
         timeoutMs: 30000,
       },
     }
-    const config = normalizeConfig(raw)
+    const config = asNtfy(normalizeConfig(raw))
     expect(config.ntfy.server).toBe("https://ntfy.example.com/prefix/")
     expect(config.events["session.error"]).toBe(false)
     expect(config.suppressSubagents["session.idle"]).toBe(false)
@@ -258,10 +313,10 @@ describe("size limits", () => {
 describe("token substitution", () => {
   it("substitutes {env:VAR} from the provided environment", async () => {
     const raw = { ntfy: { topic: "{env:NTFY_TOPIC}", token: "{env:NTFY_TOKEN}" } }
-    const config = await parseConfigText(JSON.stringify(raw), {
+    const config = asNtfy(await parseConfigText(JSON.stringify(raw), {
       dir: "/tmp",
       env: { NTFY_TOPIC: "env-topic", NTFY_TOKEN: "env-token" },
-    })
+    }))
     expect(config.ntfy.topic).toBe("env-topic")
     expect(config.ntfy.token).toBe("env-token")
   })
@@ -292,7 +347,7 @@ describe("token substitution", () => {
     const dir = await makeDir()
     const filePath = await writeConfig(JSON.stringify({ ntfy: { topic: "{file:topic.txt}" } }), dir)
     await writeFile(join(dir, "opencode", "topic.txt"), "file-topic\n", "utf8")
-    const config = await loadConfigFile(filePath)
+    const config = asNtfy(await loadConfigFile(filePath))
     expect(config.ntfy.topic).toBe("file-topic")
   })
 
@@ -301,7 +356,7 @@ describe("token substitution", () => {
     const secret = join(dir, "abs-secret.txt")
     await writeFile(secret, "  abs-token  ", "utf8")
     const filePath = await writeConfig(JSON.stringify({ ntfy: { topic: "t", token: `{file:${secret}}` } }), dir)
-    const config = await loadConfigFile(filePath)
+    const config = asNtfy(await loadConfigFile(filePath))
     expect(config.ntfy.token).toBe("abs-token")
   })
 
@@ -310,10 +365,10 @@ describe("token substitution", () => {
     const home = join(dir, "home")
     await mkdir(home, { recursive: true })
     await writeFile(join(home, "tilde-token.txt"), "tilde-token", "utf8")
-    const config = await parseConfigText(JSON.stringify({ ntfy: { topic: "t", token: "{file:~/tilde-token.txt}" } }), {
+    const config = asNtfy(await parseConfigText(JSON.stringify({ ntfy: { topic: "t", token: "{file:~/tilde-token.txt}" } }), {
       dir,
       home,
-    })
+    }))
     expect(config.ntfy.token).toBe("tilde-token")
   })
 
@@ -326,16 +381,18 @@ describe("token substitution", () => {
   })
 
   it("recurses through nested structures before validation", async () => {
-    const config = await parseConfigText(
-      JSON.stringify({
-        $schema: "{env:NTFY_SCHEMA}",
-        ntfy: { topic: "{env:NTFY_TOPIC}", server: "{env:NTFY_SERVER}" },
-        events: { "session.idle": true },
-      }),
-      {
-        dir: "/tmp",
-        env: { NTFY_SCHEMA: "https://example.invalid/s.json", NTFY_TOPIC: "nested-topic", NTFY_SERVER: "https://ntfy.example.com" },
-      },
+    const config = asNtfy(
+      await parseConfigText(
+        JSON.stringify({
+          $schema: "{env:NTFY_SCHEMA}",
+          ntfy: { topic: "{env:NTFY_TOPIC}", server: "{env:NTFY_SERVER}" },
+          events: { "session.idle": true },
+        }),
+        {
+          dir: "/tmp",
+          env: { NTFY_SCHEMA: "https://example.invalid/s.json", NTFY_TOPIC: "nested-topic", NTFY_SERVER: "https://ntfy.example.com" },
+        },
+      ),
     )
     expect(config.ntfy.topic).toBe("nested-topic")
     expect(config.ntfy.server).toBe("https://ntfy.example.com/")
@@ -344,10 +401,10 @@ describe("token substitution", () => {
   it("does not rescan substituted content for further tokens", async () => {
     const dir = await makeDir()
     await writeFile(join(dir, "payload.txt"), "{env:NTFY_SHOULD_NOT_EXPAND}", "utf8")
-    const config = await parseConfigText(JSON.stringify({ ntfy: { topic: "t", token: "{file:payload.txt}" } }), {
+    const config = asNtfy(await parseConfigText(JSON.stringify({ ntfy: { topic: "t", token: "{file:payload.txt}" } }), {
       dir,
       env: {},
-    })
+    }))
     expect(config.ntfy.token).toBe("{env:NTFY_SHOULD_NOT_EXPAND}")
   })
 
@@ -379,9 +436,8 @@ describe("token substitution", () => {
   })
 
   it("keeps ordinary strings with unrelated braces as literals", async () => {
-    const config = await parseConfigText(
-      JSON.stringify({ ntfy: { topic: "t", token: "abc{x}y{z}" } }),
-      { dir: "/tmp" },
+    const config = asNtfy(
+      await parseConfigText(JSON.stringify({ ntfy: { topic: "t", token: "abc{x}y{z}" } }), { dir: "/tmp" }),
     )
     expect(config.ntfy.token).toBe("abc{x}y{z}")
   })
@@ -473,5 +529,380 @@ describe("normalizeServerUrl", () => {
     expect(normalizeServerUrl("http://123.example")).toBe("http://123.example/")
     expect(normalizeServerUrl("http://123-example")).toBe("http://123-example/")
   })
+})
+describe("transport selection", () => {
+  it("defaults the transport to ntfy when the key is absent", () => {
+    expect(normalizeConfig({ ntfy: { topic: "t" } }).transport).toBe("ntfy")
+  })
+
+  it("accepts transport ntfy and produces the same config as the absent key", () => {
+    const withKey = normalizeConfig({ transport: "ntfy", ntfy: { topic: "t" } })
+    expect(withKey).toEqual(normalizeConfig({ ntfy: { topic: "t" } }))
+  })
+
+  it("accepts the supported transport name gotify", () => {
+    const config = normalizeConfig({
+      transport: "gotify",
+      gotify: { server: "https://gotify.example.com/", token: "gotify-app-token" },
+    })
+    expect(config.transport).toBe("gotify")
+  })
+
+  it("accepts transport webpush without an ntfy section", () => {
+    const config = normalizeConfig(webpushConfig())
+    expect(config.transport).toBe("webpush")
+    const webpush = asWebpush(config).webpush
+    expect(webpush.subject).toBe("mailto:push@example.com")
+    expect(webpush.publicKey).toBe(TEST_VAPID_PUBLIC_KEY)
+    expect(webpush.privateKey).toBe(TEST_VAPID_PRIVATE_KEY)
+    expect(webpush.storePath).toBe("/tmp/opencode/subscriptions.json")
+    expect(webpush.timeoutMs).toBe(5000)
+  })
+
+  it("accepts an explicit webpush timeoutMs within bounds", () => {
+    const config = normalizeConfig(webpushConfig({ timeoutMs: 30000 }))
+    expect(asWebpush(config).webpush.timeoutMs).toBe(30000)
+  })
+
+  it("rejects unknown transport values without echoing them", () => {
+    const error = thrownErrorOf(() => normalizeConfig({ transport: "banana", ntfy: { topic: "t" } }))
+    expect(error).toBeInstanceOf(ConfigError)
+    expect(error.message).toContain('"transport" must be one of ntfy, gotify, webpush')
+    expect(error.message).not.toContain("banana")
+  })
+
+  it("rejects non-string transport values", () => {
+    for (const value of [42, true, null, { ntfy: {} }]) {
+      expect(() => normalizeConfig({ transport: value, ntfy: { topic: "t" } })).toThrow(ConfigError)
+      expect(() => normalizeConfig({ transport: value, ntfy: { topic: "t" } })).toThrow(/"transport"/)
+    }
+  })
+
+  it("rejects a substituted transport value without echoing unrecognized content", async () => {
+    // Substitution runs before validation: an {env:} reference that expands to
+    // an unknown value must fail without leaking the expanded value.
+    const error = await rejectionOf(
+      parseConfigText(JSON.stringify({ transport: "{env:T}", ntfy: { topic: "t" } }), { dir: "/tmp", env: { T: "banana" } }),
+    )
+    expect(error.message).toContain('"transport" must be one of ntfy, gotify, webpush')
+    expect(error.message).not.toContain("banana")
+  })
+
+  it("accepts a substituted transport value that names the gotify Transport", async () => {
+    const config = asGotify(
+      await parseConfigText(
+        JSON.stringify({
+          transport: "{env:T}",
+          gotify: { server: "https://gotify.example.com/", token: "{env:GOTIFY_TOKEN}" },
+        }),
+        { dir: "/tmp", env: { T: "gotify", GOTIFY_TOKEN: "tok_env_token" } },
+      ),
+    )
+    expect(config.transport).toBe("gotify")
+    expect(config.gotify.token).toBe("tok_env_token")
+  })
+})
+describe("inactive transport sections", () => {
+  it("rejects a non-empty section of an inactive Transport as a misconfiguration", () => {
+    const error = thrownErrorOf(() =>
+      normalizeConfig({ ntfy: { topic: "t" }, gotify: { server: "https://gotify.example.com", token: "super-secret-token" } }),
+    )
+    expect(error).toBeInstanceOf(ConfigError)
+    expect(error.message).toContain('"gotify"')
+    expect(error.message).toContain('"transport"')
+    expect(error.message).toContain("ntfy")
+  })
+
+  it("never echoes settings from a rejected inactive section", () => {
+    const error = thrownErrorOf(() => normalizeConfig({ ntfy: { topic: "t" }, webpush: { subject: "mailto:me@example.com" } }))
+    expect(error.message).toContain('"webpush"')
+    expect(error.message).not.toContain("me@example.com")
+    expect(error.message).not.toContain("mailto")
+  })
+
+  it("accepts an empty inactive section", () => {
+    const config = asNtfy(normalizeConfig({ ntfy: { topic: "t" }, gotify: {}, webpush: {} }))
+    expect(config.transport).toBe("ntfy")
+    expect(config.ntfy.topic).toBe("t")
+  })
+
+  it("rejects a non-object inactive section", () => {
+    for (const section of [42, "gotify", true, []]) {
+      expect(() => normalizeConfig({ ntfy: { topic: "t" }, gotify: section })).toThrow(/"gotify" must be an object/)
+    }
+  })
+})
+
+describe("gotify transport section", () => {
+  const baseGotify = { server: "https://gotify.example.com/", token: "gotify-app-token" }
+
+  it("accepts a strictly validated gotify section and does not build an ntfy section", () => {
+    const config = normalizeConfig({
+      transport: "gotify",
+      gotify: { ...baseGotify, priority: "high", timeoutMs: 2500 },
+    })
+    expect(config.transport).toBe("gotify")
+    expect(config).toEqual({
+      enabled: true,
+      events: {
+        "session.idle": true,
+        "session.error": true,
+        "permission.asked": true,
+        "question.asked": true,
+        "agent.notify": true,
+      },
+      suppressSubagents: { "session.idle": true, "session.error": true },
+      permissionNotificationDelayMs: DEFAULT_PERMISSION_NOTIFICATION_DELAY_MS,
+      agentNotifyTools: ["opencode_notify", "openchamber_notify"],
+      enrichIdleMessages: true,
+      transport: "gotify",
+      gotify: { server: "https://gotify.example.com/", token: "gotify-app-token", priority: "high", timeoutMs: 2500 },
+    })
+  })
+
+  it("applies the gotify defaults", () => {
+    const config = asGotify(normalizeConfig({ transport: "gotify", gotify: baseGotify }))
+    expect(config.gotify.priority).toBe("default")
+    expect(config.gotify.timeoutMs).toBe(DEFAULT_TIMEOUT_MS)
+  })
+
+  it("normalizes the gotify server URL with exactly one trailing slash, like the ntfy server", () => {
+    const config = asGotify(normalizeConfig({ transport: "gotify", gotify: { ...baseGotify, server: "https://gotify.example.com/prefix" } }))
+    expect(config.gotify.server).toBe("https://gotify.example.com/prefix/")
+  })
+
+  it("rejects a missing gotify section when transport is gotify", () => {
+    const error = thrownErrorOf(() => normalizeConfig({ transport: "gotify" }))
+    expect(error).toBeInstanceOf(ConfigError)
+    expect(error.message).toContain('required property "gotify" is missing')
+  })
+
+  it("rejects a non-object gotify section when transport is gotify", () => {
+    for (const section of [42, "gotify", true, []]) {
+      expect(() => normalizeConfig({ transport: "gotify", gotify: section })).toThrow(/"gotify" must be an object/)
+    }
+  })
+
+  it("rejects unknown gotify keys", () => {
+    const error = thrownErrorOf(() => normalizeConfig({ transport: "gotify", gotify: { ...baseGotify, topic: "t" } }))
+    expect(error).toBeInstanceOf(ConfigError)
+    expect(error.message).toContain('"gotify.topic" is not allowed')
+  })
+
+  it("rejects a missing gotify server", () => {
+    const error = thrownErrorOf(() => normalizeConfig({ transport: "gotify", gotify: { token: "t" } }))
+    expect(error).toBeInstanceOf(ConfigError)
+    expect(error.message).toContain('required property "gotify.server" is missing')
+  })
+
+  it("rejects malformed gotify server URLs under the same rules as the ntfy server", () => {
+    const malformed = [
+      "ftp://gotify.example.com",
+      "https://user:pass@gotify.example.com",
+      "https://gotify.example.com/?a=b",
+      "https://gotify.example.com/#frag",
+      "https://gotify.example.com /x",
+      "gotify.example.com",
+      "",
+      "https:///gotify.example.com",
+      "https://x.test:00080",
+      "https://x.test:65536",
+      "https://x.test/%GG",
+    ]
+    for (const server of malformed) {
+      const error = thrownErrorOf(() => normalizeConfig({ transport: "gotify", gotify: { ...baseGotify, server } }))
+      expect(error).toBeInstanceOf(ConfigError)
+      expect(error.message).toContain('"gotify.server"')
+      // Secret-safe: the offending value is never echoed.
+      expect(error.message).not.toContain("ftp")
+      expect(error.message).not.toContain("user:pass")
+      expect(error.message).not.toContain("?a=b")
+    }
+  })
+
+  it("rejects a gotify token that is missing or empty without echoing it", () => {
+    const error = thrownErrorOf(() => normalizeConfig({ transport: "gotify", gotify: { server: baseGotify.server } }))
+    expect(error.message).toContain('"gotify.token"')
+    // Required-field errors share one wording across the ntfy, gotify and
+    // webpush sections.
+    expect(error.message).toContain('required property "gotify.token" is missing or not a string')
+    const empty = thrownErrorOf(() => normalizeConfig({ transport: "gotify", gotify: { ...baseGotify, token: "" } }))
+    expect(empty.message).toContain('"gotify.token"')
+    expect(empty.message).not.toContain("secret")
+  })
+
+  it("rejects a non-string gotify token", () => {
+    for (const token of [42, null, true, ["t"]]) {
+      expect(() => normalizeConfig({ transport: "gotify", gotify: { ...baseGotify, token } })).toThrow(/"gotify.token"/)
+    }
+  })
+
+  it("rejects an invalid gotify priority", () => {
+    const error = thrownErrorOf(() => normalizeConfig({ transport: "gotify", gotify: { ...baseGotify, priority: "urgent" } }))
+    expect(error).toBeInstanceOf(ConfigError)
+    expect(error.message).toContain('"gotify.priority" must be one of min, low, default, high, max')
+  })
+
+  it("rejects an out-of-range gotify timeoutMs", () => {
+    for (const timeoutMs of [0, 60001, 1.5, "5000"]) {
+      expect(() => normalizeConfig({ transport: "gotify", gotify: { ...baseGotify, timeoutMs } })).toThrow(/"gotify.timeoutMs"/)
+    }
+  })
+
+  it("rejects a non-empty ntfy section when transport is gotify", () => {
+    const error = thrownErrorOf(() =>
+      normalizeConfig({ transport: "gotify", gotify: baseGotify, ntfy: { topic: "demo-topic" } }),
+    )
+    expect(error).toBeInstanceOf(ConfigError)
+    expect(error.message).toContain('"ntfy"')
+    expect(error.message).toContain('"gotify"')
+    // The inactive section's settings are never echoed.
+    expect(error.message).not.toContain("topic")
+    expect(error.message).not.toContain("demo-topic")
+  })
+
+  it("accepts an empty ntfy section when transport is gotify", () => {
+    const config = asGotify(normalizeConfig({ transport: "gotify", gotify: baseGotify, ntfy: {} }))
+    expect(config.transport).toBe("gotify")
+    expect(config.gotify.server).toBe(baseGotify.server)
+  })
+})
+
+describe("webpush transport section", () => {
+  it("rejects transport webpush without a webpush section", () => {
+    const error = thrownErrorOf(() => normalizeConfig({ transport: "webpush" }))
+    expect(error).toBeInstanceOf(ConfigError)
+    expect(error.message).toContain('"webpush"')
+    expect(error.message).toContain("required")
+  })
+
+  it("rejects a non-object webpush section", () => {
+    for (const section of [42, "webpush", true, []]) {
+      expect(() => normalizeConfig({ transport: "webpush", webpush: section })).toThrow(/"webpush" must be an object/)
+    }
+  })
+
+  it("rejects unknown webpush keys", () => {
+    const error = thrownErrorOf(() => normalizeConfig(webpushConfig({ extra: "x" } as Partial<WebPushSettings>)))
+    expect(error.message).toContain('"webpush.extra" is not allowed')
+  })
+
+  it("rejects an invalid subject without echoing it", () => {
+    for (const subject of [undefined, 42, "", "push@example.com", "http://plain.example.com", "ftp://files.example.com", "mailto:"]) {
+      const error = thrownErrorOf(() => normalizeConfig(webpushConfig({ subject: subject as string })))
+      expect(error.message).toContain('"webpush.subject"')
+    }
+  })
+
+  it("rejects an invalid public key", () => {
+    for (const publicKey of [undefined, 42, "", "abc", "B".repeat(64), Buffer.alloc(65, 3).toString("base64url")]) {
+      const error = thrownErrorOf(() => normalizeConfig(webpushConfig({ publicKey: publicKey as string })))
+      expect(error.message).toContain('"webpush.publicKey"')
+    }
+    // A missing key is worded like the other required-field errors.
+    const missing = thrownErrorOf(() => normalizeConfig(webpushConfig({ publicKey: undefined })))
+    expect(missing.message).toContain('required property "webpush.publicKey" is missing or not a string')
+  })
+
+  it("rejects an invalid private key", () => {
+    for (const privateKey of [undefined, 42, "", "abc", Buffer.alloc(31).toString("base64url"), Buffer.alloc(33).toString("base64url")]) {
+      const error = thrownErrorOf(() => normalizeConfig(webpushConfig({ privateKey: privateKey as string })))
+      expect(error.message).toContain('"webpush.privateKey"')
+    }
+    // A missing key is worded like the other required-field errors.
+    const missing = thrownErrorOf(() => normalizeConfig(webpushConfig({ privateKey: undefined })))
+    expect(missing.message).toContain('required property "webpush.privateKey" is missing or not a string')
+  })
+
+  it("never echoes the private key value in validation errors", () => {
+    const error = thrownErrorOf(() => normalizeConfig(webpushConfig({ privateKey: "!!!not-a-key!!!" })))
+    expect(error.message).not.toContain("!!!")
+  })
+
+  it("rejects a keypair whose private key does not match the public key", () => {
+    const error = thrownErrorOf(() => normalizeConfig(webpushConfig({ privateKey: OTHER_VAPID_PRIVATE_KEY })))
+    expect(error.message).toContain('"webpush.privateKey"')
+    expect(error.message).not.toContain(OTHER_VAPID_PRIVATE_KEY)
+    expect(error.message).not.toContain(TEST_VAPID_PUBLIC_KEY)
+  })
+
+  it("rejects a missing or empty storePath", () => {
+    for (const storePath of [undefined, 42, "", "   "]) {
+      const error = thrownErrorOf(() => normalizeConfig(webpushConfig({ storePath: storePath as string })))
+      expect(error.message).toContain('"webpush.storePath"')
+    }
+  })
+
+  it("rejects an invalid webpush timeoutMs", () => {
+    for (const timeoutMs of [0, 60001, 1.5, -5, "soon"]) {
+      const error = thrownErrorOf(() => normalizeConfig(webpushConfig({ timeoutMs: timeoutMs as number })))
+      expect(error.message).toMatch(/"webpush\.timeoutMs"/)
+    }
+  })
+
+  it("rejects a non-empty ntfy section when webpush is active", () => {
+    const error = thrownErrorOf(() =>
+      normalizeConfig({ ...webpushConfig(), ntfy: { topic: "t", token: "super-secret-token" } }),
+    )
+    expect(error.message).toContain('"ntfy"')
+    expect(error.message).toContain('"transport"')
+    expect(error.message).not.toContain("super-secret-token")
+  })
+
+  it("rejects a non-empty gotify section when webpush is active", () => {
+    const error = thrownErrorOf(() =>
+      normalizeConfig({ ...webpushConfig(), gotify: { server: "https://gotify.example.com", token: "super-secret-token" } }),
+    )
+    expect(error.message).toContain('"gotify"')
+    expect(error.message).toContain('"transport"')
+    expect(error.message).not.toContain("super-secret-token")
+  })
+
+  it("rejects a non-object ntfy section when webpush is active", () => {
+    for (const section of [42, "nope", true, []]) {
+      expect(() => normalizeConfig({ transport: "webpush", webpush: validWebpushSection(), ntfy: section })).toThrow(
+        /"ntfy" must be an object/,
+      )
+    }
+  })
+
+  it("accepts an empty ntfy and gotify section when webpush is active", () => {
+    const config = normalizeConfig({ ...webpushConfig(), ntfy: {}, gotify: {} })
+    expect(config.transport).toBe("webpush")
+    expect(asWebpush(config).webpush.storePath).toBe("/tmp/opencode/subscriptions.json")
+  })
+
+  it("substitutes the VAPID private key from an environment variable", async () => {
+    const raw = { transport: "webpush", webpush: { ...validWebpushSection(), privateKey: "{env:VAPID_PRIVATE_KEY}" } }
+    const config = await parseConfigText(JSON.stringify(raw), { dir: "/tmp", env: { VAPID_PRIVATE_KEY: TEST_VAPID_PRIVATE_KEY } })
+    expect(config.transport).toBe("webpush")
+    expect(asWebpush(config).webpush.privateKey).toBe(TEST_VAPID_PRIVATE_KEY)
+  })
+
+  it("substitutes the VAPID private key from a file", async () => {
+    const dir = await makeDir()
+    const configDir = join(dir, "opencode")
+    await mkdir(configDir, { recursive: true })
+    await writeFile(join(configDir, "vapid-private.txt"), `${TEST_VAPID_PRIVATE_KEY}\n`, "utf8")
+    const raw = { transport: "webpush", webpush: { ...validWebpushSection(), privateKey: "{file:vapid-private.txt}" } }
+    const config = await parseConfigText(JSON.stringify(raw), { dir: configDir, env: {} })
+    expect(asWebpush(config).webpush.privateKey).toBe(TEST_VAPID_PRIVATE_KEY)
+  })
+
+  it("fails on an unset private key variable, naming only the variable", async () => {
+    const raw = { transport: "webpush", webpush: { ...validWebpushSection(), privateKey: "{env:VAPID_MISSING}" } }
+    const error = await rejectionOf(parseConfigText(JSON.stringify(raw), { dir: "/tmp", env: {} }))
+    expect(error.message).toMatch(/environment variable "VAPID_MISSING"/)
+    expect(error.message).not.toContain("privateKey value")
+  })
+
+  function validWebpushSection(): Record<string, string> {
+    return {
+      subject: "mailto:push@example.com",
+      publicKey: TEST_VAPID_PUBLIC_KEY,
+      privateKey: TEST_VAPID_PRIVATE_KEY,
+      storePath: "/tmp/opencode/subscriptions.json",
+    }
+  }
 })
 

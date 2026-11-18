@@ -125,6 +125,44 @@ describe("location filtering", () => {
     expect(isLocalEvent(missingLocation("a"), directory)).toBe(false)
     expect(isLocalEvent(null, directory)).toBe(false)
   })
+
+  it("dispatches location-less session.execution frames and drops other location-less frames", async () => {
+    const dispatch = vi.fn(async () => {})
+    const events = [
+      { id: "evt_done", type: "session.execution.succeeded", created: 1, data: { sessionID: "sess_done" } },
+      {
+        id: "evt_fail",
+        type: "session.execution.failed",
+        created: 1,
+        data: { sessionID: "sess_fail", error: { type: "ProviderError", message: "boom" } },
+      },
+      { id: "evt_status", type: "session.status", created: 1, data: { sessionID: "sess_status", status: { type: "idle" } } },
+      {
+        id: "evt_foreign",
+        type: "session.execution.succeeded",
+        created: 1,
+        location: { directory: "/somewhere/else" },
+        data: { sessionID: "sess_foreign" },
+      },
+    ]
+    const { source } = scriptedSource([events])
+    const runtime = createV2Runtime({ events: source, directory, dispatch })
+    runtime.start()
+    await flush()
+    // The two execution frames pass without a location; the location-less
+    // session.status frame and the foreign-location execution frame are dropped.
+    expect(dispatch).toHaveBeenCalledTimes(2)
+    expect(dispatch).toHaveBeenNthCalledWith(1, events[0])
+    expect(dispatch).toHaveBeenNthCalledWith(2, events[1])
+    await runtime.dispose()
+  })
+
+  it("exposes the strict location helper with the execution exception", () => {
+    const done = { id: "evt", type: "session.execution.succeeded", created: 1, data: { sessionID: "s" } }
+    expect(isLocalEvent(done, directory)).toBe(true)
+    expect(isLocalEvent({ ...done, location: { directory: "/somewhere/else" } }, directory)).toBe(false)
+    expect(isLocalEvent({ ...done, type: "session.status" }, directory)).toBe(false)
+  })
 })
 
 describe("reconnect backoff", () => {

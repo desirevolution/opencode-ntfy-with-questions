@@ -28,23 +28,32 @@ interface LookupState {
 
 export class SessionRegistry {
   private readonly parents = new Map<string, string | null>()
+  private readonly directories = new Map<string, string>()
+  private readonly titles = new Map<string, string>()
   private readonly lookups = new Map<string, LookupState>()
 
   /**
-   * Records or refreshes the parent of a session from a create/update event.
-   * A missing or empty parentID means the session has no parent (root).
+   * Records or refreshes the parent of a session from a create/update event or
+   * a session lookup. A missing or empty parentID means the session has no
+   * parent (root). An optional directory records the session's owning project
+   * directory (opencode >= 2.2 lookup results carry it for the ownership
+   * check; lifecycle payloads do not).
    * Invalidates any in-flight lookup for the session.
    */
-  record(sessionID: string, parentID: string | null | undefined): void {
+  record(sessionID: string, parentID: string | null | undefined, directory?: string, title?: string): void {
     if (sessionID === "") return
     this.invalidateLookup(sessionID)
     this.parents.set(sessionID, parentID && parentID !== "" ? parentID : null)
+    if (directory !== undefined) this.directories.set(sessionID, directory)
+    if (title !== undefined) this.titles.set(sessionID, title)
   }
 
   /** Removes a session (session.deleted) and invalidates its in-flight lookups. */
   remove(sessionID: string): void {
     this.invalidateLookup(sessionID)
     this.parents.delete(sessionID)
+    this.directories.delete(sessionID)
+    this.titles.delete(sessionID)
   }
 
   /**
@@ -57,6 +66,20 @@ export class SessionRegistry {
     return this.parents.get(sessionID)
   }
 
+  /**
+   * Returns the cached owning directory of a session, or undefined when the
+   * session is unknown or its directory was never learned (lifecycle-recorded
+   * sessions carry no directory).
+   */
+  directoryOf(sessionID: string): string | undefined {
+    return this.directories.get(sessionID)
+  }
+
+  /** Returns the cached human session title, or undefined when unknown. */
+  titleOf(sessionID: string): string | undefined {
+    return this.titles.get(sessionID)
+  }
+
   /** Number of cached sessions. */
   get size(): number {
     return this.parents.size
@@ -65,6 +88,8 @@ export class SessionRegistry {
   /** Clears every cached parent and invalidates all in-flight lookups. */
   clear(): void {
     this.parents.clear()
+    this.directories.clear()
+    this.titles.clear()
     for (const sessionID of this.lookups.keys()) this.invalidateLookup(sessionID)
   }
 

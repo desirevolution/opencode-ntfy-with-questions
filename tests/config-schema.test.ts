@@ -13,9 +13,46 @@ import {
   DEFAULT_NTFY_SERVER,
   DEFAULT_PERMISSION_NOTIFICATION_DELAY_MS,
   DEFAULT_TIMEOUT_MS,
+  DEFAULT_TRANSPORT,
   notificationKinds,
   type NtfyPriority,
+  type GotifyPluginConfig,
+  type NtfyPluginConfig,
+  type PluginConfig,
+  type WebPushPluginConfig,
+  type WebPushSettings,
 } from "../src/types.js"
+
+// A fixed VAPID keypair for deterministic tests, generated once with
+// `npx web-push generate-vapid-keys --json`. Test-only, never shipped.
+const TEST_VAPID_PUBLIC_KEY = "BCbA4oS2TxtmqASPvdeQyFUoNnqMtb3uzmjouUBAkfDWsb0yR84iDS3Mrs7Pn2wconyNd_PkMKaItjHEOHv_ezs"
+const TEST_VAPID_PRIVATE_KEY = "5K7qXP8V_-j1U-F8puy98fO-8q_s9m9xIdo1n4jsKpg"
+
+function webpushSection(overrides: Partial<WebPushSettings> = {}): Record<string, unknown> {
+  return {
+    subject: "mailto:push@example.com",
+    publicKey: TEST_VAPID_PUBLIC_KEY,
+    privateKey: TEST_VAPID_PRIVATE_KEY,
+    storePath: "/tmp/opencode/subscriptions.json",
+    ...overrides,
+  }
+}
+
+/** Narrows a validated config to the ntfy variant these tests assert on. */
+function asNtfy(config: PluginConfig): NtfyPluginConfig {
+  if (config.transport !== "ntfy") throw new Error("expected an active ntfy Transport")
+  return config
+}
+/** Narrows a validated config to the gotify variant these tests assert on. */
+function asGotify(config: PluginConfig): GotifyPluginConfig {
+  if (config.transport !== "gotify") throw new Error("expected an active gotify Transport")
+  return config
+}
+/** Narrows a validated config to the webpush variant these tests assert on. */
+function asWebpush(config: PluginConfig): WebPushPluginConfig {
+  if (config.transport !== "webpush") throw new Error("expected an active webpush Transport")
+  return config
+}
 
 const tempDirs: string[] = []
 
@@ -35,7 +72,7 @@ afterEach(async () => {
 async function writeConfig(text: string, dir: string): Promise<string> {
   const dirName = join(dir, "opencode")
   await mkdir(dirName, { recursive: true })
-  const filePath = join(dirName, "notification-ntfy-with-questions.json")
+  const filePath = join(dirName, "notification-notifications-with-questions.json")
   await writeFile(filePath, text, "utf8")
   return filePath
 }
@@ -51,13 +88,25 @@ async function rejectionOf(promise: Promise<unknown>): Promise<Error> {
 }
 
 describe("schema parity", () => {
-  const schemaPath = resolve(process.cwd(), "notification-ntfy-with-questions.schema.json")
+  const schemaPath = resolve(process.cwd(), "notification-notifications-with-questions.schema.json")
   const schema = JSON.parse(readFileSync(schemaPath, "utf8")) as {
     properties: {
       enabled: { default: boolean }
       events: { properties: Record<string, { default: boolean }> }
       suppressSubagents: { properties: Record<string, { default: boolean }> }
       permissionNotificationDelayMs: { default: number }
+      transport: { default: string }
+      gotify: {
+        properties: {
+          priority: { default: NtfyPriority }
+          timeoutMs: { default: number }
+        }
+      }
+      webpush: {
+        properties: {
+          timeoutMs: { default: number }
+        }
+      }
       ntfy: {
         properties: {
           server: { default: string }
@@ -79,6 +128,17 @@ describe("schema parity", () => {
     { enabled: false, ntfy: { topic: "topic-b" } },
     { permissionNotificationDelayMs: 0, ntfy: { topic: "topic-delay-zero" } },
     { permissionNotificationDelayMs: 300000, ntfy: { topic: "topic-delay-max" } },
+    { transport: "ntfy", ntfy: { topic: "topic-transport" } },
+    { ntfy: { topic: "topic-reserved" }, gotify: {}, webpush: {} },
+    { transport: "gotify", gotify: { server: "https://gotify.example.com/", token: "Aa1ExampleToken" } },
+    {
+      transport: "gotify",
+      gotify: { server: "https://gotify.example.com/prefix", token: "Aa1ExampleToken", priority: "high", timeoutMs: 2500 },
+    },
+    { transport: "gotify", gotify: { server: "https://gotify.example.com/", token: "Aa1ExampleToken" }, ntfy: {} },
+    { transport: "gotify", gotify: { server: "https://gotify.example.com/", token: "Aa1ExampleToken" }, webpush: {} },
+    { transport: "webpush", webpush: webpushSection() },
+    { transport: "webpush", webpush: webpushSection({ timeoutMs: 30000 }), ntfy: {}, gotify: {} },
     {
       events: { "session.idle": true, "session.error": false },
       suppressSubagents: { "session.idle": false },
@@ -109,6 +169,53 @@ describe("schema parity", () => {
   ]
 
   const invalidSamples = [
+    // Transport selection: only ntfy is accepted in this version.
+    { transport: "gotify", ntfy: { topic: "t" } },
+    // The active gotify section is strictly validated.
+    { transport: "gotify" },
+    { transport: "gotify", gotify: {} },
+    { transport: "gotify", gotify: { server: "https://gotify.example.com/" } },
+    { transport: "gotify", gotify: { token: "Aa1ExampleToken" } },
+    { transport: "gotify", gotify: { server: "https://gotify.example.com/", token: "" } },
+    { transport: "gotify", gotify: { server: "https://gotify.example.com/", token: 42 } },
+    { transport: "gotify", gotify: { server: "https://gotify.example.com/", token: "Aa1ExampleToken", priority: "urgent" } },
+    { transport: "gotify", gotify: { server: "https://gotify.example.com/", token: "Aa1ExampleToken", timeoutMs: 60001 } },
+    { transport: "gotify", gotify: { server: "https://gotify.example.com/", token: "Aa1ExampleToken", timeoutMs: 1.5 } },
+    { transport: "gotify", gotify: { server: "https://gotify.example.com/", token: "Aa1ExampleToken", topic: "t" } },
+    { transport: "gotify", gotify: { server: "ftp://gotify.example.com", token: "Aa1ExampleToken" } },
+    { transport: "gotify", gotify: { server: "https://user:pass@gotify.example.com", token: "Aa1ExampleToken" } },
+    { transport: "gotify", gotify: { server: "https://gotify.example.com/?a=b", token: "Aa1ExampleToken" } },
+    { transport: "gotify", gotify: { server: "gotify.example.com", token: "Aa1ExampleToken" } },
+    { transport: "gotify", gotify: { server: "", token: "Aa1ExampleToken" } },
+    { transport: "webpush", ntfy: { topic: "t" } },
+    { transport: "NTFY", ntfy: { topic: "t" } },
+    // The active webpush section is strictly validated; the inactive ntfy and
+    // gotify sections must stay empty while webpush is active.
+    { transport: "webpush", webpush: webpushSection(), ntfy: { topic: "t" } },
+    { transport: "webpush", webpush: webpushSection(), gotify: { server: "https://gotify.example.com" } },
+    { transport: "webpush" },
+    { transport: "webpush", webpush: {} },
+    { transport: "webpush", webpush: { publicKey: TEST_VAPID_PUBLIC_KEY, privateKey: TEST_VAPID_PRIVATE_KEY, storePath: "/tmp/opencode/subscriptions.json" } },
+    { transport: "webpush", webpush: webpushSection({ subject: "push@example.com" }) },
+    { transport: "webpush", webpush: webpushSection({ subject: "http://plain.example.com" }) },
+    { transport: "webpush", webpush: webpushSection({ publicKey: "not-base64url!" }) },
+    { transport: "webpush", webpush: webpushSection({ publicKey: Buffer.alloc(64).toString("base64url") }) },
+    { transport: "webpush", webpush: webpushSection({ privateKey: "not-base64url!" }) },
+    { transport: "webpush", webpush: webpushSection({ privateKey: Buffer.alloc(31).toString("base64url") }) },
+    { transport: "webpush", webpush: webpushSection({ storePath: "" }) },
+    { transport: "webpush", webpush: { subject: "mailto:push@example.com", publicKey: TEST_VAPID_PUBLIC_KEY, privateKey: TEST_VAPID_PRIVATE_KEY } },
+    { transport: "webpush", webpush: webpushSection({ timeoutMs: 0 }) },
+    { transport: "webpush", webpush: webpushSection({ timeoutMs: 60001 }) },
+    { transport: "webpush", webpush: { ...webpushSection(), extra: true } },
+    { transport: "banana", ntfy: { topic: "t" } },
+    { transport: 42, ntfy: { topic: "t" } },
+    { transport: true, ntfy: { topic: "t" } },
+    // Inactive Transport sections must stay empty.
+    { ntfy: { topic: "t" }, gotify: { server: "https://gotify.example.com" } },
+    { ntfy: { topic: "t" }, webpush: { subject: "mailto:me@example.com" } },
+    { ntfy: { topic: "t" }, gotify: 42 },
+    { ntfy: { topic: "t" }, webpush: [] },
+    { transport: "gotify", gotify: { server: "https://gotify.example.com/", token: "Aa1ExampleToken" }, ntfy: { topic: "t" } },
     { ntfy: { topic: "with space" } },
     { ntfy: { topic: "t", timeoutMs: 0 } },
     { ntfy: { topic: "t", timeoutMs: 60001 } },
@@ -191,6 +298,12 @@ describe("schema parity", () => {
     expect(validate({ ntfy: { topic: "{file:topic.txt}", server: "{file:server.txt}" } })).toBe(true)
     expect(validate({ ntfy: { topic: "t", token: "{env:NTFY_TOKEN}" } })).toBe(true)
     expect(validate({ ntfy: { topic: "t", token: "plain-token{a}b" } })).toBe(true)
+    expect(
+      validate({ transport: "webpush", webpush: { ...webpushSection(), privateKey: "{env:VAPID_PRIVATE_KEY}" } }),
+    ).toBe(true)
+    expect(
+      validate({ transport: "webpush", webpush: { ...webpushSection(), storePath: "{file:store.json}" } }),
+    ).toBe(true)
   })
 
   it("schema rejects partial or malformed reference strings", () => {
@@ -205,6 +318,11 @@ describe("schema parity", () => {
       { ntfy: { topic: "t", token: "{env:X}abc" } },
       { ntfy: { topic: "t", token: "{file:a}b" } },
       { ntfy: { topic: "t", token: "{env:   }" } },
+      { transport: "gotify", gotify: { server: "https://gotify.example.com/", token: "abc{env:X}" } },
+      { transport: "gotify", gotify: { server: "https://gotify.example.com/", token: "{env:X}abc" } },
+      { transport: "gotify", gotify: { server: "https://gotify.example.com/", token: "{file:a}b" } },
+      { transport: "gotify", gotify: { server: "https://gotify.example.com/", token: "{env:   }" } },
+      { transport: "gotify", gotify: { server: "https://x.test/{env:P}", token: "Aa1ExampleToken" } },
     ]
     for (const sample of partialSamples) {
       expect(validate(structuredClone(sample))).toBe(false)
@@ -240,9 +358,24 @@ describe("schema parity", () => {
       dir,
     )
     await writeFile(join(dir, "opencode", "server-url.txt"), "https://ntfy.example.com/base", "utf8")
-    const config = await loadConfigFile(filePath, { env: { NTFY_TOPIC: "env-topic" } })
+    const config = asNtfy(await loadConfigFile(filePath, { env: { NTFY_TOPIC: "env-topic" } }))
     expect(config.ntfy.topic).toBe("env-topic")
     expect(config.ntfy.server).toBe("https://ntfy.example.com/base/")
+  })
+
+  it("accepts exact gotify references after substitution with concrete values", async () => {
+    const dir = await makeDir()
+    const filePath = await writeConfig(
+      JSON.stringify({
+        transport: "gotify",
+        gotify: { server: "{file:gotify-server.txt}", token: "{env:GOTIFY_TOKEN}" },
+      }),
+      dir,
+    )
+    await writeFile(join(dir, "opencode", "gotify-server.txt"), "https://gotify.example.com/push", "utf8")
+    const config = asGotify(await loadConfigFile(filePath, { env: { GOTIFY_TOKEN: "tok_gotify_token" } }))
+    expect(config.gotify.server).toBe("https://gotify.example.com/push/")
+    expect(config.gotify.token).toBe("tok_gotify_token")
   })
 
   it("runtime rejects whitespace-only references with a fixed substitution error", async () => {
@@ -259,8 +392,10 @@ describe("schema parity", () => {
   })
 
   it("agrees on defaults with the JSON Schema default keywords", () => {
-    const config = normalizeConfig({ ntfy: { topic: "t" } })
+    const config = asNtfy(normalizeConfig({ ntfy: { topic: "t" } }))
     expect(config.enabled).toBe(schema.properties.enabled.default)
+    expect(config.transport).toBe(schema.properties.transport!.default)
+    expect(config.transport).toBe(DEFAULT_TRANSPORT)
     expect(config.ntfy.server).toBe(normalizeServerUrl(schema.properties.ntfy.properties.server.default))
     expect(config.ntfy.priority).toBe(schema.properties.ntfy.properties.priority.default)
     expect(config.ntfy.timeoutMs).toBe(schema.properties.ntfy.properties.timeoutMs.default)
@@ -275,5 +410,15 @@ describe("schema parity", () => {
     expect(DEFAULT_NTFY_PRIORITY).toBe(schema.properties.ntfy.properties.priority.default)
     expect(DEFAULT_TIMEOUT_MS).toBe(schema.properties.ntfy.properties.timeoutMs.default)
     expect(DEFAULT_PERMISSION_NOTIFICATION_DELAY_MS).toBe(schema.properties.permissionNotificationDelayMs.default)
+    const gotifyConfig = asGotify(
+      normalizeConfig({ transport: "gotify", gotify: { server: "https://gotify.example.com/", token: "Aa1ExampleToken" } }),
+    )
+    expect(gotifyConfig.gotify.priority).toBe(schema.properties.gotify.properties.priority.default)
+    expect(gotifyConfig.gotify.timeoutMs).toBe(schema.properties.gotify.properties.timeoutMs.default)
+    const webpushConfig = asWebpush(
+      normalizeConfig({ transport: "webpush", webpush: webpushSection() }),
+    )
+    expect(webpushConfig.webpush.timeoutMs).toBe(schema.properties.webpush.properties.timeoutMs.default)
+    expect(webpushConfig.webpush.timeoutMs).toBe(DEFAULT_TIMEOUT_MS)
   })
 })

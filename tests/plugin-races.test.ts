@@ -2,9 +2,9 @@ import { describe, expect, it, vi } from "vitest"
 
 import { normalizeConfig } from "../src/config.js"
 import { createPluginHandlers, type Logger, type SessionLookupResult } from "../src/notification-handlers.js"
-import type { NtfyClient, NtfyMessage } from "../src/ntfy-client.js"
 import { SessionRegistry } from "../src/session-registry.js"
-import type { PluginConfig } from "../src/types.js"
+import type { TransportAdapter } from "../src/transport.js"
+import type { NotificationDraft, PluginConfig } from "../src/types.js"
 
 function makeConfig(overrides: { delay?: number } = {}): PluginConfig {
   return normalizeConfig({ permissionNotificationDelayMs: overrides.delay ?? 0, ntfy: { topic: "demo-topic" } })
@@ -17,11 +17,12 @@ function harness(
     config?: PluginConfig
   } = {},
 ) {
-  const sent: NtfyMessage[] = []
-  const ntfy: NtfyClient = {
-    publish: async (message) => {
-      sent.push(message)
+  const sent: NotificationDraft[] = []
+  const transport: TransportAdapter = {
+    publish: async (draft) => {
+      sent.push(draft)
     },
+    describeError: () => "publish failed",
   }
   const logMessages: string[] = []
   const logger: Logger = (message: string) => logMessages.push(message)
@@ -30,8 +31,9 @@ function harness(
   const handlers = createPluginHandlers({
     config: overrides.config ?? makeConfig(),
     projectName: "demo-project",
+        directory: "/proj",
     getSession: getMock,
-    ntfy,
+    transport,
     registry,
     log: logger,
     sessionLookupTimeoutMs: overrides.sessionLookupTimeoutMs,

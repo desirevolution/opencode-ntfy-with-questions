@@ -1,5 +1,5 @@
 /**
- * opencode-ntfy-with-questions entry point (native opencode v2 plugin).
+ * opencode-notifications-with-questions entry point (native opencode v2 plugin).
  *
  * The default export is a `Plugin.define`d v2 plugin. Setup loads the external
  * config, registers the question tool hook and starts the global event-stream
@@ -17,8 +17,8 @@ import {
   defaultLogger,
   type Logger,
 } from "./notification-handlers.js"
-import { createNtfyClient } from "./ntfy-client.js"
 import { SessionRegistry } from "./session-registry.js"
+import { createTransport } from "./transport.js"
 import { createV2Runtime } from "./v2-runtime.js"
 import type { PluginConfig } from "./types.js"
 
@@ -46,7 +46,7 @@ export interface CreatePluginDeps {
  */
 export function createPlugin(deps: CreatePluginDeps = {}): Plugin.Plugin {
   return Plugin.define({
-    id: "opencode-ntfy-with-questions",
+    id: "opencode-notifications-with-questions",
     async setup(ctx) {
       const loader = deps.loadConfig ?? loadConfigFile
       const config = await loader()
@@ -62,14 +62,18 @@ export function createPlugin(deps: CreatePluginDeps = {}): Plugin.Plugin {
           // Swallow logger failures deliberately.
         }
       }
-      const ntfy = createNtfyClient(config.ntfy, { fetch: deps.fetch })
+      const transport = createTransport(config, { fetch: deps.fetch, log })
       const handlers = createPluginHandlers({
         config,
         projectName: projectLabel(ctx.location.directory),
+        directory: ctx.location.directory,
         // # Reason: native `session.get` resolves directly to the session info,
         // so the core reads `parentID` off the result with no data/error wrapper.
         getSession: (sessionID) => ctx.session.get({ sessionID }),
-        ntfy,
+        // Idle enrichment source: the session's message list, raced against a
+        // short deadline by the core (best-effort, never blocking the agent).
+        getSessionContext: (sessionID) => ctx.session.context({ sessionID }),
+        transport,
         registry: new SessionRegistry(),
         log,
       })
@@ -78,6 +82,7 @@ export function createPlugin(deps: CreatePluginDeps = {}): Plugin.Plugin {
       try {
         toolRegistration = await ctx.tool.hook("execute.before", async (event) => {
           await handlers.question(event.tool, event.input)
+          await handlers.notify(event.tool, event.input)
         })
       } catch (error) {
         // # Reason: the event stream was not started yet, so the handlers hold

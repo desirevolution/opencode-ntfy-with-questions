@@ -78,14 +78,14 @@ function makeContext(options: {
 
 describe("native v2 plugin shape", () => {
   it("exports a Plugin.define shape without any legacy server export", () => {
-    expect(pluginModuleDefault.id).toBe("opencode-ntfy-with-questions")
+    expect(pluginModuleDefault.id).toBe("opencode-notifications-with-questions")
     expect(typeof pluginModuleDefault.setup).toBe("function")
     expect("server" in pluginModuleDefault).toBe(false)
   })
 
   it("createPlugin returns a plugin value with id and setup", () => {
     const plugin = createPlugin()
-    expect(plugin.id).toBe("opencode-ntfy-with-questions")
+    expect(plugin.id).toBe("opencode-notifications-with-questions")
     expect(typeof plugin.setup).toBe("function")
   })
 

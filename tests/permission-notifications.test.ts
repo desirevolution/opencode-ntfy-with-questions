@@ -2,11 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { normalizeConfig } from "../src/config.js"
 import { createPluginHandlers, type Logger } from "../src/notification-handlers.js"
-import type { NtfyClient, NtfyMessage } from "../src/ntfy-client.js"
 import { SessionRegistry } from "../src/session-registry.js"
+import type { TransportAdapter } from "../src/transport.js"
 import {
   DEFAULT_PERMISSION_NOTIFICATION_DELAY_MS,
   type NtfySettings,
+  type NotificationDraft,
   type PluginConfig,
 } from "../src/types.js"
 
@@ -28,25 +29,28 @@ function harness(
   overrides: {
     config?: PluginConfig
     registry?: SessionRegistry
-    publish?: (message: NtfyMessage) => Promise<void> | void
+    publish?: (draft: NotificationDraft) => Promise<void> | void
     log?: Logger
   } = {},
 ) {
-  const sent: NtfyMessage[] = []
+  const sent: NotificationDraft[] = []
   const publish =
     overrides.publish ??
-    (async (message: NtfyMessage) => {
-      sent.push(message)
+    (async (draft: NotificationDraft) => {
+      sent.push(draft)
     })
-  const ntfy = { publish } as unknown as NtfyClient
+  // A sync-throwing publish must still reach the handler untouched, so the
+  // publish is cast instead of wrapped in an async adapter.
+  const transport = { publish, describeError: () => "publish failed" } as unknown as TransportAdapter
   const logMessages: string[] = []
   const logger: Logger = overrides.log ?? ((message: string) => logMessages.push(message))
   const registry = overrides.registry ?? new SessionRegistry()
   const handlers = createPluginHandlers({
     config: overrides.config ?? config(),
     projectName: "demo-project",
+        directory: "/proj",
     getSession: async () => ({}),
-    ntfy,
+    transport,
     registry,
     log: logger,
   })

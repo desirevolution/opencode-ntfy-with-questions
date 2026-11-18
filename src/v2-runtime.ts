@@ -67,9 +67,18 @@ export function eventLocationDirectory(event: unknown): string | undefined {
  * True only when the event carries the exact plugin directory. Locations are
  * canonical in the API, so no normalization is applied (and no session lookup
  * fallback is performed, which would add ordering/deadline hazards).
+ *
+ * Exception: `session.execution.*` events are emitted WITHOUT a location in
+ * opencode >= 2.2, so they pass this gate without one and the handler verifies
+ * ownership through the native session lookup (which reports the session
+ * directory via `location.directory`). Everything else still requires the
+ * exact match.
  */
 export function isLocalEvent(event: unknown, directory: string): boolean {
-  return eventLocationDirectory(event) === directory
+  if (eventLocationDirectory(event) === directory) return true
+  const record = asRecord(event)
+  const type = typeof record?.["type"] === "string" ? (record["type"] as string) : ""
+  return type.startsWith("session.execution.") && eventLocationDirectory(event) === undefined
 }
 
 /**

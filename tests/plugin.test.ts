@@ -2,15 +2,17 @@ import { describe, expect, it, vi } from "vitest"
 
 import { normalizeConfig } from "../src/config.js"
 import { createPluginHandlers, type Logger, type SessionLookupResult } from "../src/notification-handlers.js"
-import { createNtfyClient, type NtfyClient, type NtfyMessage } from "../src/ntfy-client.js"
 import { SessionRegistry } from "../src/session-registry.js"
-import type { NtfySettings, PluginConfig } from "../src/types.js"
+import { createNtfyTransport, type TransportAdapter } from "../src/transport.js"
+import type { NtfySettings, NotificationDraft, PluginConfig } from "../src/types.js"
 
 function config(
   overrides: {
     enabled?: boolean
     events?: Record<string, boolean>
     suppressSubagents?: { "session.idle"?: boolean; "session.error"?: boolean }
+    agentNotifyTools?: string[]
+    enrichIdleMessages?: boolean
     ntfy?: Partial<NtfySettings>
   } = {},
 ): PluginConfig {
@@ -19,6 +21,8 @@ function config(
     enabled: overrides.enabled ?? true,
     events: overrides.events,
     suppressSubagents: overrides.suppressSubagents,
+    agentNotifyTools: overrides.agentNotifyTools,
+    enrichIdleMessages: overrides.enrichIdleMessages,
     ntfy: { topic: "demo-topic", ...overrides.ntfy },
   })
 }
@@ -27,20 +31,23 @@ function harness(
   overrides: {
     config?: PluginConfig
     registry?: SessionRegistry
-    publish?: (message: NtfyMessage) => Promise<void> | void
+    publish?: (draft: NotificationDraft) => Promise<void> | void
     get?: (sessionID: string) => Promise<SessionLookupResult>
+    getSessionContext?: (sessionID: string) => Promise<unknown>
+    sessionContextTimeoutMs?: number
     log?: Logger
+    now?: () => number
   } = {},
 ) {
-  const sent: NtfyMessage[] = []
+  const sent: NotificationDraft[] = []
   const publish =
     overrides.publish ??
-    (async (message: NtfyMessage) => {
-      sent.push(message)
+    (async (draft: NotificationDraft) => {
+      sent.push(draft)
     })
   // A sync-throwing publish must still reach the handler untouched, so the
   // publish is cast instead of wrapped in an async adapter.
-  const ntfy = { publish } as unknown as NtfyClient
+  const transport = { publish, describeError: () => "publish failed" } as unknown as TransportAdapter
   const logMessages: string[] = []
   const logger: Logger = overrides.log ?? ((message: string) => logMessages.push(message))
   const getMock = vi.fn(async (sessionID: string) => (overrides.get ? overrides.get(sessionID) : {}))
@@ -48,13 +55,21 @@ function harness(
   const handlers = createPluginHandlers({
     config: overrides.config ?? config(),
     projectName: "demo-project",
+    directory: "/proj",
+    ...(overrides.now ? { now: overrides.now } : {}),
+    ...(overrides.getSessionContext ? { getSessionContext: overrides.getSessionContext } : {}),
+    ...(overrides.sessionContextTimeoutMs !== undefined ? { sessionContextTimeoutMs: overrides.sessionContextTimeoutMs } : {}),
     getSession: getMock,
-    ntfy,
+    transport,
     registry,
     log: logger,
   })
   return { handlers, sent, logMessages, getMock, registry }
 }
+
+const executionSucceeded = (sessionID: string) => ({
+  event: { id: "evt_done", type: "session.execution.succeeded", created: 1, data: { sessionID } },
+})
 
 const idle = (sessionID: string) => ({
   event: { id: "evt_idle", type: "session.status", created: 1, data: { sessionID, status: { type: "idle" } } },
@@ -206,6 +221,185 @@ describe("subagent classification", () => {
     const h = harness({ get: async () => ({ parentID: "sess_parent" }) })
     await h.handlers.event(sessionError("sess_hidden_child"))
     expect(h.sent).toHaveLength(0)
+  })
+})
+
+describe("location-less execution events (opencode >= 2.2)", () => {
+  it("notifies a location-less execution.succeeded whose session directory matches", async () => {
+    const h = harness({ get: async () => ({ location: { directory: "/proj" } }) })
+    await h.handlers.event(executionSucceeded("sess_done"))
+    expect(h.sent).toHaveLength(1)
+    expect(h.sent[0]?.tags).toEqual(["hourglass_done"])
+    expect(h.getMock).toHaveBeenCalledTimes(1)
+    expect(h.logMessages).toHaveLength(0)
+  })
+
+  it("drops a location-less execution event owned by another directory", async () => {
+    const h = harness({ get: async () => ({ location: { directory: "/elsewhere" } }) })
+    await h.handlers.event(executionSucceeded("sess_foreign"))
+    expect(h.sent).toHaveLength(0)
+    expect(h.getMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("drops a location-less execution error owned by another directory", async () => {
+    const h = harness({ get: async () => ({ directory: "/elsewhere" }) })
+    await h.handlers.event(sessionError("sess_fail_foreign"))
+    expect(h.sent).toHaveLength(0)
+    expect(h.getMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("fails open silently when the lookup carries no directory (older opencode)", async () => {
+    const h = harness()
+    await h.handlers.event(executionSucceeded("sess_legacy"))
+    expect(h.sent).toHaveLength(1)
+    expect(h.logMessages).toHaveLength(0)
+  })
+
+  it("one lookup answers ownership and subagent suppression", async () => {
+    const h = harness({ get: async () => ({ parentID: "sess_parent", location: { directory: "/proj" } }) })
+    await h.handlers.event(executionSucceeded("sess_child_done"))
+    // Owned by this instance, but a known subagent: suppressed, one lookup.
+    expect(h.sent).toHaveLength(0)
+    expect(h.getMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("drops the secondary session.status idle within the dedup window after an execution idle", async () => {
+    let clock = 0
+    const h = harness({ get: async () => ({ location: { directory: "/proj" } }), now: () => clock })
+    await h.handlers.event(executionSucceeded("sess_both"))
+    expect(h.sent).toHaveLength(1)
+    clock = 100
+    await h.handlers.event(idle("sess_both"))
+    expect(h.sent).toHaveLength(1)
+    // The dedup check short-circuits before any lookup.
+    expect(h.getMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("notifies again once the dedup window has passed", async () => {
+    let clock = 0
+    const h = harness({ get: async () => ({ location: { directory: "/proj" } }), now: () => clock })
+    await h.handlers.event(executionSucceeded("sess_again"))
+    expect(h.sent).toHaveLength(1)
+    clock = 3000
+    await h.handlers.event(idle("sess_again"))
+    expect(h.sent).toHaveLength(2)
+  })
+
+  it("never deduplicates the primary source", async () => {
+    const h = harness({ get: async () => ({ location: { directory: "/proj" } }) })
+    await h.handlers.event(executionSucceeded("sess_primary"))
+    await h.handlers.event(executionSucceeded("sess_primary"))
+    expect(h.sent).toHaveLength(2)
+  })
+})
+
+describe("agent.notify forwarding and idle enrichment", () => {
+  const notifyArgs = { title: "Build finished", body: "npm run build succeeded" }
+
+  it("forwards a configured notify tool call with title, body and the bell tag", async () => {
+    const h = harness()
+    await h.handlers.notify("opencode_notify", notifyArgs)
+    expect(h.sent).toHaveLength(1)
+    expect(h.sent[0]).toEqual({
+      kind: "agent.notify",
+      title: "demo-project - Build finished",
+      message: "npm run build succeeded",
+      tags: ["bell"],
+    })
+  })
+
+  it("accepts the nested {action, parameters} shape and falls back for missing fields", async () => {
+    const h = harness()
+    await h.handlers.notify("openchamber_notify", { action: "notify.send", parameters: { title: "Done" } })
+    expect(h.sent).toHaveLength(1)
+    expect(h.sent[0]?.title).toContain("Done")
+    expect(h.sent[0]?.message).toBe("The agent asked to notify you.")
+  })
+
+  it("ignores unlisted tools, respects the toggle, and never throws on malformed args", async () => {
+    const h = harness()
+    await h.handlers.notify("bash", notifyArgs)
+    expect(h.sent).toHaveLength(0)
+    const off = harness({ config: config({ events: { "agent.notify": false } }) })
+    await off.handlers.notify("opencode_notify", notifyArgs)
+    expect(off.sent).toHaveLength(0)
+    for (const args of [undefined, null, "text", {}]) {
+      const one = harness()
+      await one.handlers.notify("opencode_notify", args)
+      expect(one.sent).toHaveLength(1)
+    }
+  })
+
+  it("forwards custom configured tool names", async () => {
+    const h = harness({ config: config({ agentNotifyTools: ["my_notify"] }) })
+    await h.handlers.notify("my_notify", notifyArgs)
+    expect(h.sent).toHaveLength(1)
+    await h.handlers.notify("opencode_notify", notifyArgs)
+    expect(h.sent).toHaveLength(1)
+  })
+
+  it("enriches the idle notification with the session title and last output", async () => {
+    let contextCalls = 0
+    const h = harness({
+      get: async () => ({ location: { directory: "/proj" }, title: "Fix login bug" }),
+      getSessionContext: async () => {
+        contextCalls += 1
+        return [{ type: "assistant", content: [{ type: "text", text: "Fixed the redirect loop." }] }]
+      },
+    })
+    await h.handlers.event(executionSucceeded("sess_title"))
+    expect(h.sent).toHaveLength(1)
+    expect(h.sent[0]?.message).toContain("Fix login bug")
+    expect(h.sent[0]?.message).toContain("Fixed the redirect loop.")
+    expect(contextCalls).toBe(1)
+  })
+
+  it("falls back to the generic idle message when the context call fails", async () => {
+    const h = harness({
+      get: async () => ({ location: { directory: "/proj" } }),
+      getSessionContext: async () => {
+        throw new Error("context endpoint down")
+      },
+    })
+    await h.handlers.event(executionSucceeded("sess_failmsg"))
+    expect(h.sent).toHaveLength(1)
+    expect(h.sent[0]?.message).toContain('"sess_failmsg"')
+    expect(h.sent[0]?.message).not.toContain("Fixed")
+  })
+
+  it("races the context call against the enrichment deadline", async () => {
+    const h = harness({
+      get: async () => ({ location: { directory: "/proj" } }),
+      getSessionContext: () => new Promise(() => {}),
+      sessionContextTimeoutMs: 20,
+    })
+    const started = Date.now()
+    await h.handlers.event(executionSucceeded("sess_hang_ctx"))
+    expect(Date.now() - started).toBeLessThan(2000)
+    expect(h.sent).toHaveLength(1)
+    expect(h.sent[0]?.message).toContain('"sess_hang_ctx"')
+  })
+
+  it("sends generic idle messages when enrichment is off", async () => {
+    let contextCalls = 0
+    const h = harness({
+      config: config({ enrichIdleMessages: false }),
+      get: async () => ({ location: { directory: "/proj" }, title: "Fix login bug" }),
+      getSessionContext: async () => {
+        contextCalls += 1
+        return []
+      },
+    })
+    await h.handlers.event(executionSucceeded("sess_plain"))
+    expect(h.sent).toHaveLength(1)
+    expect(h.sent[0]?.message).toBe('Session "sess_plain" has finished its run and is idle.\nIt is waiting for your next instruction.')
+    expect(contextCalls).toBe(0)
+  })
+
+  it("uses the session title without a context call when the title is cached", async () => {
+    const h = harness({ get: async () => ({ location: { directory: "/proj" }, title: "Fix login bug" }) })
+    await h.handlers.event(executionSucceeded("sess_named"))
+    expect(h.sent[0]?.message).toContain("Fix login bug")
   })
 })
 
@@ -372,8 +566,9 @@ describe("log redaction", () => {
     const handlers = createPluginHandlers({
       config: config({ ntfy: ntfySettings }),
       projectName: "demo-project",
+        directory: "/proj",
       getSession: async () => ({}),
-      ntfy: createNtfyClient(ntfySettings, { fetch: fetchMock as unknown as typeof fetch }),
+      transport: createNtfyTransport(ntfySettings, { fetch: fetchMock as unknown as typeof fetch }),
       registry: new SessionRegistry(),
       log: (message) => logMessages.push(message),
     })

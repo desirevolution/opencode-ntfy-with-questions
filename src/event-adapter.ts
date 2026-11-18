@@ -14,7 +14,7 @@ export type LifecycleAction = "created" | "deleted"
 
 export type ParsedEvent =
   | { kind: "lifecycle"; action: LifecycleAction; sessionID: string; parentID: string | null }
-  | { kind: "session.idle"; sessionID: string }
+  | { kind: "session.idle"; sessionID: string; source: "execution" | "status" }
   | { kind: "session.error"; sessionID: string | undefined; errorMessage: string }
   | {
       kind: "permission.asked"
@@ -41,8 +41,10 @@ function nonEmptyString(value: unknown): string | undefined {
  * - `question.*` / `question.v2.*` / `form.*`: question notifications come
  *   exclusively from the `tool.execute.before` hook filtered by the exact tool
  *   name `question`, so a question is never notified twice.
- * - the deprecated `session.idle`: `session.status` with `status.type === "idle"`
- *   is the single source of idle notifications (avoids a duplicate per run).
+ * - the deprecated `session.idle`: `session.execution.succeeded` is the
+ *   primary idle source (opencode >= 2.2), and `session.status` with
+ *   `status.type === "idle"` stays a de-duplicated secondary source for older
+ *   or TUI-driven contexts, so a single run never produces two notifications.
  * - the legacy `session.error` (native errors arrive as
  *   `session.execution.failed`) and transient `session.step.failed` /
  *   `session.retry.scheduled` frames.
@@ -70,6 +72,15 @@ export function parseRuntimeEvent(envelope: unknown): ParsedEvent | null {
       if (!sessionID) return null
       return { kind: "lifecycle", action: "deleted", sessionID, parentID: null }
     }
+    case "session.execution.succeeded": {
+      // opencode >= 2.2 emits the run-completion event as
+      // `session.execution.succeeded`; this is the primary idle source. It
+      // maps onto the same idle Notification Kind as `session.status` idle,
+      // which stays a de-duplicated secondary source (see the handler).
+      const sessionID = nonEmptyString(data?.sessionID)
+      if (!sessionID) return null
+      return { kind: "session.idle", sessionID, source: "execution" }
+    }
     case "session.status": {
       const sessionID = nonEmptyString(data?.sessionID)
       if (!sessionID) return null
@@ -77,7 +88,7 @@ export function parseRuntimeEvent(envelope: unknown): ParsedEvent | null {
       // Only the terminal `idle` status notifies; `busy` and `retry` are
       // transient and are ignored.
       if (nonEmptyString(status?.type) !== "idle") return null
-      return { kind: "session.idle", sessionID }
+      return { kind: "session.idle", sessionID, source: "status" }
     }
     case "session.execution.failed": {
       const sessionID = nonEmptyString(data?.sessionID)
@@ -132,9 +143,32 @@ function draft(kind: NotificationDraft["kind"], title: string, message: string):
   return { kind, title, message, tags: [kindTags[kind]] }
 }
 
-export function formatIdleDraft(sessionID: string, projectName: string): NotificationDraft {
-  const message = `Session ${sessionID} has finished its run and is idle.\nIt is waiting for your next instruction.`
+export function formatIdleDraft(
+  sessionID: string,
+  projectName: string,
+  details: { title?: string | null; lastMessage?: string | null } = {},
+): NotificationDraft {
+  // Prefer a human session title over the opaque session ID.
+  const subject = details.title && details.title.trim() !== "" ? details.title.trim() : sessionID
+  let message = `Session "${subject}" has finished its run and is idle.\nIt is waiting for your next instruction.`
+  const lastMessage = details.lastMessage?.trim()
+  if (lastMessage && lastMessage !== "") message += `\n\n${lastMessage}`
   return draft("session.idle", `${projectName} - session idle`, message)
+}
+
+/**
+ * Formats an explicit agent notify request. Tool args are accepted flat
+ * (`{title, body}`) or nested (`{action, parameters: {title, body}}`), matching
+ * the notify tools in the user's setup; missing fields fall back to a generic
+ * text instead of throwing. Title and body are agent-controlled and are
+ * sanitized and truncated by the active Transport at publish time.
+ */
+export function formatAgentNotifyDraft(args: unknown, projectName: string): NotificationDraft {
+  const record = asRecord(args)
+  const parameters = asRecord(record?.["parameters"])
+  const title = nonEmptyString(record?.["title"]) ?? nonEmptyString(parameters?.["title"]) ?? "notification"
+  const body = nonEmptyString(record?.["body"]) ?? nonEmptyString(parameters?.["body"]) ?? "The agent asked to notify you."
+  return draft("agent.notify", `${projectName} - ${title}`, body)
 }
 
 export function formatErrorDraft(

@@ -3,9 +3,10 @@
  *
  * The config file is intentionally NOT backward compatible with the older
  * `notification-ntfy.json`: this plugin reads
- * `notification-ntfy-with-questions.json` from the opencode config directory.
+ * `notification-notifications-with-questions.json` from the opencode config directory.
  */
 
+import { createECDH } from "node:crypto"
 import { open } from "node:fs/promises"
 import { isAbsolute, dirname, join } from "node:path"
 import { homedir as defaultHomedir } from "node:os"
@@ -16,17 +17,27 @@ import {
   DEFAULT_NTFY_SERVER,
   DEFAULT_PERMISSION_NOTIFICATION_DELAY_MS,
   DEFAULT_TIMEOUT_MS,
+  DEFAULT_TRANSPORT,
+  MAX_AGENT_NOTIFY_TOOL_LENGTH,
+  MAX_AGENT_NOTIFY_TOOLS,
   MAX_CONFIG_FILE_BYTES,
   MAX_PERMISSION_NOTIFICATION_DELAY_MS,
   MAX_REFERENCED_FILE_BYTES,
   MAX_TIMEOUT_MS,
   MIN_TIMEOUT_MS,
+  defaultAgentNotifyTools,
   notificationKinds,
   ntfyPriorities,
   TOPIC_PATTERN,
+  transportSectionNames,
+  transports,
   type NotificationKind,
   type NtfyPriority,
+  type GotifySettings,
+  type NtfySettings,
   type PluginConfig,
+  type TransportName,
+  type WebPushSettings,
 } from "./types.js"
 
 /**
@@ -50,9 +61,64 @@ const TOP_LEVEL_KEYS = new Set([
   "events",
   "suppressSubagents",
   "permissionNotificationDelayMs",
+  "agentNotifyTools",
+  "enrichIdleMessages",
+  "transport",
+  // Per-Transport sections. A section belonging to an inactive Transport must
+  // be absent or empty; the active Transport's section is validated strictly.
+  "webpush",
+  "gotify",
   "ntfy",
 ])
 const NTFY_KEYS = new Set(["server", "topic", "token", "priority", "timeoutMs"])
+const WEBPUSH_KEYS = new Set(["subject", "publicKey", "privateKey", "storePath", "timeoutMs"])
+
+/** Unpadded (or padded) base64url: exactly the alphabet web-push tooling emits. */
+const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+={0,2}$/
+
+/**
+ * Decodes a base64url string to exactly `expectedBytes` bytes, or undefined
+ * when the encoding or the length is wrong. Callers report only the failing
+ * config key name - decoded key material is never echoed.
+ */
+function decodeBase64url(value: string, expectedBytes: number): Buffer | undefined {
+  if (!BASE64URL_PATTERN.test(value)) return undefined
+  const bytes = Buffer.from(value, "base64url")
+  if (bytes.length !== expectedBytes) return undefined
+  return bytes
+}
+
+/**
+ * VAPID subject per RFC 8292: a `mailto:` contact with a non-empty address or
+ * an `https:` URL with a non-empty host.
+ */
+function isValidVapidSubject(subject: string): boolean {
+  let url: URL
+  try {
+    url = new URL(subject)
+  } catch {
+    return false
+  }
+  if (url.protocol === "mailto:") return url.pathname.trim() !== ""
+  if (url.protocol === "https:") return url.hostname !== ""
+  return false
+}
+
+/**
+ * Derives the uncompressed P-256 public key that belongs to a VAPID private
+ * key, or undefined when the private key is unusable. Used to fail a
+ * mismatched VAPID keypair at startup instead of at first publish.
+ */
+function vapidPublicKeyFrom(privateBytes: Buffer): Buffer | undefined {
+  try {
+    const curve = createECDH("prime256v1")
+    curve.setPrivateKey(privateBytes)
+    return curve.getPublicKey()
+  } catch {
+    return undefined
+  }
+}
+const GOTIFY_KEYS = new Set(["server", "token", "priority", "timeoutMs"])
 
 /**
  * Substitution is full-value-only: a valid reference must occupy the entire
@@ -124,8 +190,8 @@ async function readUtf8FileWithinLimit(
 
 /**
  * Absolute path of the plugin config file:
- * `$XDG_CONFIG_HOME/opencode/notification-ntfy-with-questions.json`, or
- * `~/.config/opencode/notification-ntfy-with-questions.json` when XDG_CONFIG_HOME
+ * `$XDG_CONFIG_HOME/opencode/notification-notifications-with-questions.json`, or
+ * `~/.config/opencode/notification-notifications-with-questions.json` when XDG_CONFIG_HOME
  * is not set.
  */
 export function resolveConfigFilePath(
@@ -301,6 +367,33 @@ export function normalizeConfig(raw: unknown): PluginConfig {
   for (const key of Object.keys(raw)) {
     if (!TOP_LEVEL_KEYS.has(key)) throw invalid(`unknown top-level property "${key}" is not allowed`)
   }
+  // The `transport` key selects the active Transport. Only implemented
+  // Transports are accepted; an invalid value is rejected with one
+  // actionable, secret-safe error that never echoes the offending value
+  // (a substituted value could carry user content).
+  let transport: TransportName = DEFAULT_TRANSPORT
+  const rawTransport = raw["transport"]
+  if (rawTransport !== undefined) {
+    if (typeof rawTransport !== "string" || !(transports as readonly string[]).includes(rawTransport)) {
+      throw invalid(`"transport" must be one of ${transports.join(", ")}`)
+    }
+    transport = rawTransport as TransportName
+  }
+  // A section belonging to an inactive Transport must be absent or empty.
+  // Content there signals a misconfiguration: the user believes a channel is
+  // configured while it is silently unused.
+  for (const sectionName of transportSectionNames) {
+    if (sectionName === transport) continue
+    const section = raw[sectionName]
+    if (section === undefined) continue
+    if (!isPlainObject(section)) throw invalid(`"${sectionName}" must be an object`)
+    if (Object.keys(section).length > 0) {
+      throw invalid(
+        `"${sectionName}" is configured but the active transport is "${transport}"; ` +
+          `remove the "${sectionName}" section or set "transport" to "${sectionName}"`,
+      )
+    }
+  }
 
   const enabled = readBoolean(raw, "enabled", true)
 
@@ -351,8 +444,72 @@ export function normalizeConfig(raw: unknown): PluginConfig {
     permissionNotificationDelayMs = rawDelay
   }
 
+  let agentNotifyTools: string[] = [...defaultAgentNotifyTools]
+  const rawTools = raw["agentNotifyTools"]
+  if (rawTools !== undefined) {
+    if (!Array.isArray(rawTools)) throw invalid('"agentNotifyTools" must be an array of strings')
+    if (rawTools.length === 0 || rawTools.length > MAX_AGENT_NOTIFY_TOOLS) {
+      throw invalid(`"agentNotifyTools" must contain between 1 and ${MAX_AGENT_NOTIFY_TOOLS} entries`)
+    }
+    const seen = new Set<string>()
+    for (const tool of rawTools) {
+      if (typeof tool !== "string" || tool.trim() === "" || tool.length > MAX_AGENT_NOTIFY_TOOL_LENGTH) {
+        throw invalid(`"agentNotifyTools" entries must be strings of 1-${MAX_AGENT_NOTIFY_TOOL_LENGTH} characters`)
+      }
+      if (seen.has(tool)) throw invalid('"agentNotifyTools" must not contain duplicates')
+      seen.add(tool)
+    }
+    agentNotifyTools = rawTools as string[]
+  }
+
+  const enrichIdleMessages = readBoolean(raw, "enrichIdleMessages", true)
+
+  if (transport === "gotify") {
+    return {
+      enabled,
+      events,
+      suppressSubagents,
+      permissionNotificationDelayMs,
+      agentNotifyTools,
+      enrichIdleMessages,
+      transport,
+      gotify: parseGotifySettings(raw["gotify"]),
+    }
+  }
+
+  if (transport === "webpush") {
+    return {
+      enabled,
+      events,
+      suppressSubagents,
+      permissionNotificationDelayMs,
+      agentNotifyTools,
+      enrichIdleMessages,
+      transport,
+      webpush: parseWebpushSettings(raw["webpush"]),
+    }
+  }
+
   const rawNtfy = raw["ntfy"]
   if (rawNtfy === undefined) throw invalid('required property "ntfy" is missing')
+  return {
+    enabled,
+    events,
+    suppressSubagents,
+    permissionNotificationDelayMs,
+    agentNotifyTools,
+    enrichIdleMessages,
+    transport,
+    ntfy: parseNtfySettings(rawNtfy),
+  }
+}
+
+/**
+ * Validates the active ntfy section and applies its defaults. Unknown keys
+ * are rejected here against NTFY_KEYS; the caller only dispatches on the
+ * active Transport.
+ */
+function parseNtfySettings(rawNtfy: unknown): NtfySettings {
   if (!isPlainObject(rawNtfy)) throw invalid('"ntfy" must be an object')
   for (const key of Object.keys(rawNtfy)) {
     if (!NTFY_KEYS.has(key)) throw invalid(`"ntfy.${key}" is not allowed`)
@@ -376,34 +533,124 @@ export function normalizeConfig(raw: unknown): PluginConfig {
     token = tokenValue
   }
 
-  let priority: NtfyPriority = DEFAULT_NTFY_PRIORITY
-  const priorityValue = rawNtfy["priority"]
-  if (priorityValue !== undefined) {
-    if (typeof priorityValue !== "string" || !(ntfyPriorities as readonly string[]).includes(priorityValue)) {
-      throw invalid('"ntfy.priority" must be one of min, low, default, high, max')
-    }
-    priority = priorityValue as NtfyPriority
+  return {
+    server,
+    topic,
+    token,
+    priority: readNamedPriority(rawNtfy["priority"], "ntfy"),
+    timeoutMs: readTimeoutMs(rawNtfy["timeoutMs"], "ntfy"),
+  }
+}
+
+/**
+ * Validates the active gotify section and applies its defaults. Server URL
+ * rules mirror the ntfy server; the application token is required because
+ * Gotify rejects unauthenticated message posts.
+ */
+function parseGotifySettings(section: unknown): GotifySettings {
+  if (section === undefined) throw invalid('required property "gotify" is missing')
+  if (!isPlainObject(section)) throw invalid('"gotify" must be an object')
+  for (const key of Object.keys(section)) {
+    if (!GOTIFY_KEYS.has(key)) throw invalid(`"gotify.${key}" is not allowed`)
   }
 
-  let timeoutMs = DEFAULT_TIMEOUT_MS
-  const timeoutValue = rawNtfy["timeoutMs"]
-  if (timeoutValue !== undefined) {
-    if (typeof timeoutValue !== "number" || !Number.isInteger(timeoutValue)) {
-      throw invalid('"ntfy.timeoutMs" must be an integer')
-    }
-    if (timeoutValue < MIN_TIMEOUT_MS || timeoutValue > MAX_TIMEOUT_MS) {
-      throw invalid(`"ntfy.timeoutMs" must be between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS}`)
-    }
-    timeoutMs = timeoutValue
+  const serverValue = section["server"]
+  if (serverValue === undefined) throw invalid('required property "gotify.server" is missing')
+  const server = normalizeServerUrl(serverValue as string, "gotify")
+
+  const tokenValue = section["token"]
+  if (tokenValue === undefined) throw invalid('required property "gotify.token" is missing or not a string')
+  if (typeof tokenValue !== "string" || tokenValue.length === 0) {
+    throw invalid('"gotify.token" must be a non-empty string')
   }
 
   return {
-    enabled,
-    events,
-    suppressSubagents,
-    permissionNotificationDelayMs,
-    ntfy: { server, topic, token, priority, timeoutMs },
+    server,
+    token: tokenValue,
+    priority: readNamedPriority(section["priority"], "gotify"),
+    timeoutMs: readTimeoutMs(section["timeoutMs"], "gotify"),
   }
+}
+
+/**
+ * Validates the active webpush section and applies its defaults. Every error
+ * names the offending key only: substituted values, key material and endpoints
+ * are never echoed.
+ */
+function parseWebpushSettings(section: unknown): WebPushSettings {
+  if (section === undefined) {
+    throw invalid('required property "webpush" is missing when "transport" is "webpush"')
+  }
+  if (!isPlainObject(section)) throw invalid('"webpush" must be an object')
+  for (const key of Object.keys(section)) {
+    if (!WEBPUSH_KEYS.has(key)) throw invalid(`"webpush.${key}" is not allowed`)
+  }
+
+  const subject = section["subject"]
+  if (typeof subject !== "string" || !isValidVapidSubject(subject)) {
+    throw invalid('"webpush.subject" must be a "mailto:" or "https://" contact URI')
+  }
+
+  const publicKey = section["publicKey"]
+  if (typeof publicKey !== "string") throw invalid('required property "webpush.publicKey" is missing or not a string')
+  const publicBytes = decodeBase64url(publicKey, 65)
+  if (publicBytes === undefined || publicBytes[0] !== 0x04) {
+    throw invalid('"webpush.publicKey" must be a base64url-encoded 65-byte uncompressed P-256 VAPID public key')
+  }
+
+  const privateKey = section["privateKey"]
+  if (typeof privateKey !== "string") throw invalid('required property "webpush.privateKey" is missing or not a string')
+  const privateBytes = decodeBase64url(privateKey, 32)
+  if (privateBytes === undefined) {
+    throw invalid('"webpush.privateKey" must be a base64url-encoded 32-byte VAPID private key')
+  }
+  // A mismatched keypair would only fail opaquely at the push service, so it
+  // is rejected here by deriving the public key from the private one. The
+  // derived key material never appears in the error message.
+  const derivedPublic = vapidPublicKeyFrom(privateBytes)
+  if (derivedPublic === undefined || !derivedPublic.equals(publicBytes)) {
+    throw invalid('"webpush.privateKey" and "webpush.publicKey" do not form a matching VAPID keypair')
+  }
+
+  const storePath = section["storePath"]
+  if (typeof storePath !== "string" || storePath.trim() === "") {
+    throw invalid('"webpush.storePath" must be a non-empty string path of the Subscription Store file')
+  }
+
+  // Unlike the per-request ntfy/gotify timeouts, this deadline bounds one
+  // whole fan-out across all Subscriptions of a publish.
+  return {
+    subject,
+    publicKey,
+    privateKey,
+    storePath,
+    timeoutMs: readTimeoutMs(section["timeoutMs"], "webpush"),
+  }
+}
+
+/**
+ * Validates one of the plugin's named priority levels for a Transport section.
+ */
+function readNamedPriority(value: unknown, section: string): NtfyPriority {
+  if (value === undefined) return DEFAULT_NTFY_PRIORITY
+  if (typeof value !== "string" || !(ntfyPriorities as readonly string[]).includes(value)) {
+    throw invalid(`"${section}.priority" must be one of min, low, default, high, max`)
+  }
+  return value as NtfyPriority
+}
+
+/**
+ * Validates the bounded per-publish timeout for a Transport section.
+ */
+function readTimeoutMs(value: unknown, section: string): number {
+  if (value === undefined) return DEFAULT_TIMEOUT_MS
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw invalid(`"${section}.timeoutMs" must be an integer`)
+  }
+  if (value < MIN_TIMEOUT_MS || value > MAX_TIMEOUT_MS) {
+    throw invalid(`"${section}.timeoutMs" must be between ${MIN_TIMEOUT_MS} and ${MAX_TIMEOUT_MS}`)
+  }
+  return value
 }
 
 function allTrueEvents(): Record<NotificationKind, boolean> {
@@ -412,6 +659,7 @@ function allTrueEvents(): Record<NotificationKind, boolean> {
     "session.error": true,
     "permission.asked": true,
     "question.asked": true,
+    "agent.notify": true,
   }
 }
 
@@ -433,35 +681,35 @@ function readBoolean(raw: Record<string, unknown>, key: string, fallback: boolea
  * whitespace and any raw `?`/`#` (even empty delimiters) are rejected. `new URL`
  * stays the final semantic validator.
  */
-export function normalizeServerUrl(input: string): string {
+export function normalizeServerUrl(input: string, section = "ntfy"): string {
   if (typeof input !== "string" || input.trim() === "") {
-    throw invalid('"ntfy.server" must be a non-empty string')
+    throw invalid(`"${section}.server" must be a non-empty string`)
   }
   // The WHATWG URL parser tolerates several inputs that must stay invalid for
   // parity with the bundled JSON Schema (whitespace, empty query/fragment
   // delimiters, triple-slash authorities, zero-padded ports, exotic hosts).
   // Inspect the raw string before parsing so those are rejected up front.
   if (/\s/.test(input)) {
-    throw invalid('"ntfy.server" must not contain whitespace')
+    throw invalid(`"${section}.server" must not contain whitespace`)
   }
-  if (input.includes("?")) throw invalid('"ntfy.server" must not contain a query string')
-  if (input.includes("#")) throw invalid('"ntfy.server" must not contain a fragment')
+  if (input.includes("?")) throw invalid(`"${section}.server" must not contain a query string`)
+  if (input.includes("#")) throw invalid(`"${section}.server" must not contain a fragment`)
   if (!/^[Hh][Tt][Tt][Pp][Ss]?:\/\//.test(input)) {
-    throw invalid('"ntfy.server" must start with http:// or https://')
+    throw invalid(`"${section}.server" must start with http:// or https://`)
   }
   if (SERVER_CREDENTIALS_PATTERN.test(input)) {
-    throw invalid('"ntfy.server" must not contain credentials')
+    throw invalid(`"${section}.server" must not contain credentials`)
   }
   if (!SERVER_SHAPE_PATTERN.test(input)) {
-    throw invalid('"ntfy.server" is not a valid URL')
+    throw invalid(`"${section}.server" is not a valid URL`)
   }
   let url: URL
   try {
     url = new URL(input)
   } catch {
-    throw invalid('"ntfy.server" is not a valid URL')
+    throw invalid(`"${section}.server" is not a valid URL`)
   }
-  if (!url.hostname) throw invalid('"ntfy.server" must include a host')
+  if (!url.hostname) throw invalid(`"${section}.server" must include a host`)
   const pathname = url.pathname.replace(/\/+$/, "")
   return `${url.protocol}//${url.host}${pathname}/`
 }
