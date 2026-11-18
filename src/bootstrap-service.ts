@@ -8,11 +8,10 @@
  * the mirror image: the browser unsubscribes its own subscription and posts
  * the endpoint; the service removes the entry if present.
  *
- * The service holds no accounts and no data beyond Subscriptions. The only
- * secret-adjacent material it ever touches is the public VAPID key; the
- * private key is never accepted by any option of this module. Endpoints are
- * never logged or echoed: HTTP error responses carry fixed, value-free text,
- * and log lines name only outcomes and counts.
+ * The service holds no accounts and no data beyond Subscriptions. To send
+ * an explicit test notification it optionally loads a VAPID secret from a
+ * local file (never sent to the browser or written to logs). Subscription
+ * endpoint URLs and key material are also never logged or echoed.
  *
  * Store discipline is the plugin's: reads go through the shared strict store
  * loader, writes go through the shared atomic writer (temp file + rename).
@@ -27,12 +26,15 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http"
 import { realpathSync } from "node:fs"
+import { readFile } from "node:fs/promises"
+import { sendNotification } from "web-push"
 import { pathToFileURL } from "node:url"
 
 import {
   loadSubscriptionStore,
   SubscriptionStoreReadError,
   writeSubscriptionStore,
+  type PushSubscriptionEntry,
 } from "./subscription-store.js"
 import type { Logger } from "./types.js"
 import { bootstrapPageHtml, serviceWorkerJs } from "./bootstrap-page.js"
@@ -42,6 +44,14 @@ export interface BootstrapServiceOptions {
   storePath: string
   /** The plugin's public VAPID key (`webpush.publicKey`); served to browsers. */
   vapidPublicKey: string
+  /** Optional path to the secret VAPID key; used only for per-browser test pushes. */
+  vapidPrivateKeyFile?: string
+  /** Public VAPID contact subject for the test push. */
+  vapidSubject?: string
+  /** Optional browser target for test pushes (e.g. OpenCode Web home). */
+  testUrl?: string
+  /** Injectable test sender, primarily for network-free route tests. */
+  testPush?: (subscription: PushSubscriptionEntry) => Promise<void>
   /** Address to bind. Default `127.0.0.1` — the reverse proxy fronts this service. */
   host?: string
   /** TCP port. Default `8089`; `0` lets the OS pick a port. */
@@ -317,6 +327,8 @@ interface RequestContext {
   vapidPublicKey: string
   log: Logger
   enqueueMutation: <T>(task: () => Promise<T>) => Promise<T>
+  testPush?: (subscription: PushSubscriptionEntry) => Promise<void>
+  lastTestAt: Map<string, number>
 }
 
 async function handleRequest(ctx: RequestContext, req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -325,7 +337,7 @@ async function handleRequest(ctx: RequestContext, req: IncomingMessage, res: Ser
   const method = req.method ?? ""
   const path = new URL(req.url ?? "/", "http://bootstrap.invalid").pathname
   if (method !== "GET" && method !== "POST") {
-    sendNotAllowed(res, path === "/register" || path === "/deregister" ? "POST" : "GET, POST")
+    sendNotAllowed(res, path === "/register" || path === "/deregister" || path === "/test" ? "POST" : "GET, POST")
     return
   }
   if (path === "/" || path === "/index.html") {
@@ -342,6 +354,57 @@ async function handleRequest(ctx: RequestContext, req: IncomingMessage, res: Ser
       return
     }
     sendText(res, 200, "text/javascript; charset=utf-8", serviceWorkerJs)
+    return
+  }
+  if (path === "/test") {
+    if (method !== "POST") { sendNotAllowed(res, "POST"); return }
+    if (!contentTypeIsJson(req)) {
+      sendJson(res, 415, { ok: false, error: "expected a content-type of application/json" }); return
+    }
+    // Extra defense against requests forged by another browser origin.
+    const origin = req.headers.origin
+    if (typeof origin === "string") {
+      try {
+        if (new URL(origin).host !== req.headers.host) {
+          sendJson(res, 403, { ok: false, error: "cross-origin requests are not allowed" }); return
+        }
+      } catch {
+        sendJson(res, 403, { ok: false, error: "invalid request origin" }); return
+      }
+    }
+    if (ctx.testPush === undefined) {
+      sendJson(res, 503, { ok: false, error: "test notifications are not configured" }); return
+    }
+    const body = await readBody(req)
+    if (body === undefined) { sendJson(res, 413, { ok: false, error: "the request body is too large" }); return }
+    let endpoint: string
+    try {
+      endpoint = parseDeregisterBody(body)
+    } catch (cause) {
+      sendJson(res, 400, { ok: false, error: cause instanceof MalformedRequestError ? cause.message : "invalid request" }); return
+    }
+    try {
+      const entries = await loadSubscriptionStore(ctx.storePath)
+      const entry = entries.find((item): item is PushSubscriptionEntry => {
+        if (!isPlainObject(item) || item["endpoint"] !== endpoint) return false
+        const keys = item["keys"]
+        return isPlainObject(keys) && typeof keys["p256dh"] === "string" && typeof keys["auth"] === "string"
+      })
+      if (!entry) {
+        sendJson(res, 404, { ok: false, error: "registration not found on server; register this browser again" }); return
+      }
+      const now = Date.now()
+      if (now - (ctx.lastTestAt.get(endpoint) ?? 0) < 15_000) {
+        sendJson(res, 429, { ok: false, error: "please wait 15 seconds before testing again" }); return
+      }
+      ctx.lastTestAt.set(endpoint, now)
+      await ctx.testPush(entry)
+      ctx.log("bootstrap: test push accepted by provider")
+      sendJson(res, 200, { ok: true, result: "accepted" })
+    } catch (cause) {
+      ctx.log(`bootstrap: test push failed (${errorCodeOf(cause)}); no endpoint or credentials logged`)
+      sendJson(res, 502, { ok: false, error: "push service did not accept the test notification" })
+    }
     return
   }
   if (path === "/register" || path === "/deregister") {
@@ -396,6 +459,16 @@ function listen(server: Server, host: string, port: number): Promise<void> {
   })
 }
 
+/** Payload used by the optional per-browser test route. Never includes secrets. */
+export function buildBootstrapTestPayload(testUrl?: string): string {
+  return JSON.stringify({
+    kind: "test",
+    title: "OpenCode · Test notification",
+    message: "Web Push is working on this browser.",
+    ...(testUrl ? { url: testUrl } : {}),
+  })
+}
+
 /** Starts the Bootstrap Service. Resolves once the server is listening. */
 export async function startBootstrapService(options: BootstrapServiceOptions): Promise<BootstrapServiceHandle> {
   const storePath = options.storePath
@@ -414,7 +487,40 @@ export async function startBootstrapService(options: BootstrapServiceOptions): P
     throw new Error("invalid port: expected an integer between 0 and 65535")
   }
   const log: Logger = options.log ?? (() => {})
-  const ctx: RequestContext = { storePath, vapidPublicKey: options.vapidPublicKey, log, enqueueMutation: serializeMutations() }
+  const testUrl = options.testUrl?.trim()
+  if (testUrl) {
+    let parsed: URL
+    try { parsed = new URL(testUrl) }
+    catch { throw new Error("invalid test URL: expected an absolute http(s) URL") }
+    if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+        !parsed.hostname || parsed.username || parsed.password) {
+      throw new Error("invalid test URL: expected an absolute http(s) URL without credentials")
+    }
+  }
+  let testPush = options.testPush
+  if (testPush === undefined && options.vapidPrivateKeyFile !== undefined) {
+    const privateKey = (await readFile(options.vapidPrivateKeyFile, "utf8")).trim()
+    const subject = options.vapidSubject
+    if (!privateKey || !subject || !(subject.startsWith("https://") || subject.startsWith("mailto:"))) {
+      throw new Error("test push requires a valid VAPID private key file and contact subject")
+    }
+    testPush = async (subscription) => {
+      await sendNotification(subscription, buildBootstrapTestPayload(testUrl), {
+        vapidDetails: { subject, publicKey: options.vapidPublicKey, privateKey },
+        TTL: 60,
+        timeout: 8000,
+        contentEncoding: "aes128gcm",
+      })
+    }
+  }
+  const ctx: RequestContext = {
+    storePath,
+    vapidPublicKey: options.vapidPublicKey,
+    log,
+    enqueueMutation: serializeMutations(),
+    testPush,
+    lastTestAt: new Map(),
+  }
   const server = createServer((req, res) => {
     void handleRequest(ctx, req, res).catch((cause: unknown) => {
       log(`bootstrap: request handling failed (${errorCodeOf(cause)})`)
@@ -454,13 +560,19 @@ Options (each also reads from the environment, named in brackets):
                              plugin's webpush.storePath
                              [OPENCODE_NTFY_SUBSCRIPTION_STORE]
   --vapid-public-key <key>   the plugin's public VAPID key (webpush.publicKey);
-                             the private key is never accepted
+                             the raw private key is never accepted
                              [OPENCODE_NTFY_VAPID_PUBLIC_KEY]
   --host <addr>              address to bind (default 127.0.0.1; keep it
                              loopback and put your TLS reverse proxy in front)
                              [OPENCODE_NTFY_HOST]
   --port <n>                 TCP port (default 8089; 0 picks a free port)
                              [OPENCODE_NTFY_PORT]
+  --vapid-private-key-file <path>  Secret VAPID key file (enables real test push)
+                             [OPENCODE_NTFY_VAPID_PRIVATE_KEY_FILE]
+  --vapid-subject <value>    VAPID contact subject for the test push
+                             [OPENCODE_NTFY_VAPID_SUBJECT]
+  --test-url <url>          Optional click destination for test pushes
+                             [OPENCODE_NTFY_TEST_URL]
   -h, --help                 show this help
 
 Routes:
@@ -468,6 +580,7 @@ Routes:
   GET  /service-worker.js   the page's push service worker
   POST /register            body: the browser's PushSubscription.toJSON()
   POST /deregister          body: {"endpoint": "https://..."}
+  POST /test                body: {"endpoint": "https://..."} (only registered endpoints)
 
 Host this behind your reverse proxy with TLS: browsers only expose the Push
 API in secure contexts. See the README section "Bootstrap Service" for the
@@ -478,6 +591,9 @@ export interface BootstrapCliOptions {
   vapidPublicKey: string
   host: string
   port: number
+  vapidPrivateKeyFile?: string
+  vapidSubject?: string
+  testUrl?: string
 }
 
 function requireValue(argv: readonly string[], index: number, option: string): string {
@@ -496,14 +612,17 @@ function parsePort(value: string): number {
 }
 
 /**
- * Parses CLI flags with environment fallbacks. Unknown options are rejected
- * — in particular no private-key option exists anywhere in this module.
+ * Parses CLI flags with environment fallbacks. Unknown options are rejected.
+ * The test sender accepts only a path to a private-key file, never raw keys.
  */
 export function parseBootstrapArgs(argv: readonly string[], env: NodeJS.ProcessEnv = process.env): BootstrapCliOptions {
   let storePath: string | undefined
   let vapidPublicKey: string | undefined
   let host: string | undefined
   let port: number | undefined
+  let vapidPrivateKeyFile: string | undefined
+  let vapidSubject: string | undefined
+  let testUrl: string | undefined
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!
     const [name, inlineValue] = arg.startsWith("--") && arg.includes("=") ? splitInlineOption(arg) : [arg, undefined]
@@ -521,6 +640,15 @@ export function parseBootstrapArgs(argv: readonly string[], env: NodeJS.ProcessE
       case "--port":
         port = parsePort(takeValue())
         break
+      case "--vapid-private-key-file":
+        vapidPrivateKeyFile = takeValue()
+        break
+      case "--vapid-subject":
+        vapidSubject = takeValue()
+        break
+      case "--test-url":
+        testUrl = takeValue()
+        break
       default:
         throw new Error(`unknown option "${name}" (see --help)`)
     }
@@ -528,6 +656,9 @@ export function parseBootstrapArgs(argv: readonly string[], env: NodeJS.ProcessE
   storePath ??= env["OPENCODE_NTFY_SUBSCRIPTION_STORE"]
   vapidPublicKey ??= env["OPENCODE_NTFY_VAPID_PUBLIC_KEY"]
   host ??= env["OPENCODE_NTFY_HOST"] ?? DEFAULT_HOST
+  vapidPrivateKeyFile ??= env["OPENCODE_NTFY_VAPID_PRIVATE_KEY_FILE"]
+  vapidSubject ??= env["OPENCODE_NTFY_VAPID_SUBJECT"]
+  testUrl ??= env["OPENCODE_NTFY_TEST_URL"]
   if (port === undefined) {
     const envPort = env["OPENCODE_NTFY_PORT"]
     port = envPort === undefined ? DEFAULT_PORT : parsePort(envPort)
@@ -538,7 +669,7 @@ export function parseBootstrapArgs(argv: readonly string[], env: NodeJS.ProcessE
   if (vapidPublicKey === undefined || vapidPublicKey.trim() === "") {
     throw new Error("missing required option --vapid-public-key (or environment variable OPENCODE_NTFY_VAPID_PUBLIC_KEY)")
   }
-  return { storePath, vapidPublicKey, host, port }
+  return { storePath, vapidPublicKey, host, port, ...(vapidPrivateKeyFile ? { vapidPrivateKeyFile } : {}), ...(vapidSubject ? { vapidSubject } : {}), ...(testUrl ? { testUrl } : {}) }
 }
 
 function splitInlineOption(arg: string): [string, string] {

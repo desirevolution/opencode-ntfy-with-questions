@@ -90,7 +90,7 @@ export function describeWebpushError(error: unknown): string {
 export function buildWebpushPayload(draft: NotificationDraft): string {
   const title = truncateUtf8(draft.title, MAX_TITLE_BYTES)
   const payloadFor = (message: string): string =>
-    JSON.stringify({ kind: draft.kind, title, message, tags: draft.tags })
+    JSON.stringify({ kind: draft.kind, title, message, tags: draft.tags, ...(draft.url ? { url: draft.url } : {}) })
   let message = truncateUtf8(draft.message, MAX_MESSAGE_BYTES)
   let payload = payloadFor(message)
   while (Buffer.byteLength(payload, "utf8") > MAX_PAYLOAD_PLAINTEXT_BYTES && message.length > 0) {

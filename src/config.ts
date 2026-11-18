@@ -71,7 +71,7 @@ const TOP_LEVEL_KEYS = new Set([
   "ntfy",
 ])
 const NTFY_KEYS = new Set(["server", "topic", "token", "priority", "timeoutMs"])
-const WEBPUSH_KEYS = new Set(["subject", "publicKey", "privateKey", "storePath", "timeoutMs"])
+const WEBPUSH_KEYS = new Set(["subject", "publicKey", "privateKey", "storePath", "timeoutMs", "webUiBaseUrl", "webUiServerUrl"])
 
 /** Unpadded (or padded) base64url: exactly the alphabet web-push tooling emits. */
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+={0,2}$/
@@ -617,6 +617,21 @@ function parseWebpushSettings(section: unknown): WebPushSettings {
     throw invalid('"webpush.storePath" must be a non-empty string path of the Subscription Store file')
   }
 
+
+  // Browser click targets are opt-in. Both values are normalized and validated
+  // without accepting credentials, query strings, fragments or whitespace.
+  const webUiBaseUrl = section["webUiBaseUrl"] === undefined
+    ? undefined : normalizeServerUrl(section["webUiBaseUrl"] as string, "webpush.webUiBaseUrl")
+  if (section["webUiServerUrl"] !== undefined && webUiBaseUrl === undefined) {
+    throw invalid('"webpush.webUiServerUrl" requires "webpush.webUiBaseUrl"')
+  }
+  const webUiServerUrl = section["webUiServerUrl"] === undefined
+    ? undefined : normalizeServerUrl(section["webUiServerUrl"] as string, "webpush.webUiServerUrl")
+  if ((webUiBaseUrl && Buffer.byteLength(webUiBaseUrl, "utf8") > 1024) ||
+      (webUiServerUrl && Buffer.byteLength(webUiServerUrl, "utf8") > 1024)) {
+    throw invalid('"webpush.webUiBaseUrl" and "webpush.webUiServerUrl" must be at most 1024 bytes each')
+  }
+
   // Unlike the per-request ntfy/gotify timeouts, this deadline bounds one
   // whole fan-out across all Subscriptions of a publish.
   return {
@@ -624,6 +639,8 @@ function parseWebpushSettings(section: unknown): WebPushSettings {
     publicKey,
     privateKey,
     storePath,
+    ...(webUiBaseUrl ? { webUiBaseUrl } : {}),
+    ...(webUiServerUrl ? { webUiServerUrl } : {}),
     timeoutMs: readTimeoutMs(section["timeoutMs"], "webpush"),
   }
 }

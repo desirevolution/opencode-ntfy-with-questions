@@ -81,8 +81,8 @@ export function createPlugin(deps: CreatePluginDeps = {}): Plugin.Plugin {
       let toolRegistration: { dispose: () => Promise<void> | void }
       try {
         toolRegistration = await ctx.tool.hook("execute.before", async (event) => {
-          await handlers.question(event.tool, event.input)
-          await handlers.notify(event.tool, event.input)
+          await handlers.question(event.tool, event.input, event.sessionID)
+          await handlers.notify(event.tool, event.input, event.sessionID)
         })
       } catch (error) {
         // # Reason: the event stream was not started yet, so the handlers hold

@@ -452,6 +452,46 @@ fail plugin initialization with an actionable error message. Error messages
 never print substituted values, secrets or file contents - only key names,
 variable names and paths.
 
+### Extra Web Push features (Dev-Environment port)
+
+This fork also supports a dark, mobile-friendly browser registration page with
+registration state, a **Send test notification** button, and clickable push
+notifications that reopen the corresponding OpenCode Web session.
+
+To enable click destinations, set these **optional keys** in the plugin's
+`webpush` configuration (fragment, not a complete config):
+
+```jsonc
+"webUiBaseUrl": "https://code.example.com/",
+"webUiServerUrl": "http://127.0.0.1:4096/"
+```
+
+`webUiBaseUrl` is the public browser URL. `webUiServerUrl` is the exact
+connection URL OpenCode Web encodes into its `/server/<base64url>/session/<id>`
+paths. The second value is optional and defaults to the public URL. Determine
+it from one known-working session link rather than guessing. Both options
+reject credentials, query strings, and fragments. Without `webUiBaseUrl`,
+push notifications still work, but click targets fall back to the registration
+page.
+
+The optional test route is enabled only when the bootstrap service can read
+the VAPID private key **from a file** and has a valid VAPID subject. Supply:
+
+```sh
+OPENCODE_NTFY_VAPID_PRIVATE_KEY_FILE=/path/to/vapid-private-key \
+OPENCODE_NTFY_VAPID_SUBJECT=mailto:admin@example.com \
+OPENCODE_NTFY_TEST_URL=https://code.example.com/ \
+  opencode-notifications-bootstrap \
+    --store /path/to/webpush-subscriptions.json \
+    --vapid-public-key "<public key>"
+```
+
+`POST /test` accepts an existing registered endpoint only, and rate-limits
+each endpoint to one attempt every 15 seconds. A response `accepted` means the
+push provider accepted the message, **not** that the browser displayed it.
+Keep the registration service behind HTTPS and authenticated reverse-proxy
+access (for example, Caddy + Authelia). The service itself has no login.
+
 ## Bootstrap Service (Web Push device registration)
 
 The Web Push transport registers devices on a small register/deregister

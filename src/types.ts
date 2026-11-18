@@ -101,6 +101,10 @@ export interface WebPushSettings {
    * by the Bootstrap Service) read fresh at publish time.
    */
   storePath: string
+  /** Public URL of the OpenCode Web UI; optional click destination. */
+  webUiBaseUrl?: string
+  /** Exact server connection URL used in OpenCode Web; defaults to the public URL. */
+  webUiServerUrl?: string
   /** Deadline in milliseconds bounding one whole fan-out publish. */
   timeoutMs: number
 }
@@ -186,6 +190,8 @@ export interface NotificationDraft {
   title: string
   message: string
   tags: string[]
+  /** Optional click target, sent only through the Web Push transport. */
+  url?: string
 }
 
 export const CONFIG_FILE_NAME = "notification-notifications-with-questions.json"

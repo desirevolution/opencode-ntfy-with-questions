@@ -18,6 +18,7 @@ import {
 } from "./event-adapter.js"
 import { describeNtfyError } from "./ntfy-client.js"
 import { SessionRegistry } from "./session-registry.js"
+import { openCodeWebTarget } from "./webui-link.js"
 import type { TransportAdapter } from "./transport.js"
 import { eventLocationDirectory } from "./v2-runtime.js"
 import {
@@ -167,13 +168,13 @@ export function extractSessionDirectory(result: SessionLookupResult): string | u
 
 export interface PluginHandlers {
   event(input: { event: unknown }): Promise<void>
-  question(tool: string, args: unknown): Promise<void>
+  question(tool: string, args: unknown, sessionID?: string): Promise<void>
   /**
    * Forwards a notify tool call from the `execute.before` hook as an
    * `agent.notify` notification, when the tool is listed in the configured
    * `agentNotifyTools`. Explicit requests are never suppressed or deduplicated.
    */
-  notify(tool: string, args: unknown): Promise<void>
+  notify(tool: string, args: unknown, sessionID?: string): Promise<void>
   /** Cancels every pending delayed permission notification. */
   dispose(): Promise<void>
 }
@@ -206,6 +207,11 @@ export function createPluginHandlers(deps: HandlerDeps): PluginHandlers {
   const log = deps.log ?? defaultLogger
   const config = deps.config
   const projectName = deps.projectName
+  const linkDraft = (draft: NotificationDraft, sessionID?: string): NotificationDraft => {
+    if (config.transport !== "webpush") return draft
+    const url = openCodeWebTarget(config.webpush, sessionID)
+    return url ? { ...draft, url } : draft
+  }
   const pluginDirectory = deps.directory
   const now = deps.now ?? Date.now
   const lookupTimeoutMs = resolveSessionLookupTimeout(deps.sessionLookupTimeoutMs)
@@ -323,7 +329,7 @@ export function createPluginHandlers(deps: HandlerDeps): PluginHandlers {
       // even if publish rejects and the injected logger throws while reporting
       // it. Formatting failures are swallowed for the same reason.
       try {
-        void send(formatPermissionDraft(permission, patterns, sessionID, projectName)).catch(() => {})
+        void send(linkDraft(formatPermissionDraft(permission, patterns, sessionID, projectName), sessionID)).catch(() => {})
       } catch {
         // A formatting failure must not become an uncaught timer exception.
       }
@@ -561,7 +567,7 @@ export function createPluginHandlers(deps: HandlerDeps): PluginHandlers {
           if (disposed) return
           const title = config.enrichIdleMessages ? registry.titleOf(parsed.sessionID) : undefined
           const lastMessage = config.enrichIdleMessages ? await raceLastMessage(parsed.sessionID) : undefined
-          await send(formatIdleDraft(parsed.sessionID, projectName, { title, lastMessage }))
+          await send(linkDraft(formatIdleDraft(parsed.sessionID, projectName, { title, lastMessage }), parsed.sessionID))
           if (parsed.source === "execution") markIdlePublished(parsed.sessionID, now())
           return
         }
@@ -570,7 +576,7 @@ export function createPluginHandlers(deps: HandlerDeps): PluginHandlers {
           // An error without a sessionID cannot be classified and always notifies.
           if (!(await sessionGate(parsed, input.event))) return
           if (disposed) return
-          await send(formatErrorDraft(parsed.sessionID, parsed.errorMessage, projectName))
+          await send(linkDraft(formatErrorDraft(parsed.sessionID, parsed.errorMessage, projectName), parsed.sessionID))
           return
         }
         case "permission.asked": {
@@ -584,7 +590,7 @@ export function createPluginHandlers(deps: HandlerDeps): PluginHandlers {
             return
           }
           // Delay 0 keeps the original behavior: publish before returning.
-          await send(formatPermissionDraft(parsed.permission, parsed.patterns, parsed.sessionID, projectName))
+          await send(linkDraft(formatPermissionDraft(parsed.permission, parsed.patterns, parsed.sessionID, projectName), parsed.sessionID))
           return
         }
         case "permission.replied": {
@@ -601,14 +607,14 @@ export function createPluginHandlers(deps: HandlerDeps): PluginHandlers {
     }
   }
 
-  const onQuestion = async (tool: string, args: unknown): Promise<void> => {
+  const onQuestion = async (tool: string, args: unknown, sessionID?: string): Promise<void> => {
     if (disposed) return
     try {
       if (!config.events["question.asked"]) return
       // Notify only for the exact built-in tool name. The runtime question/form
       // events are deliberately ignored by parseRuntimeEvent to avoid duplicates.
       if (typeof tool !== "string" || tool !== QUESTION_TOOL_NAME) return
-      await send(formatQuestionDraft(args, projectName))
+      await send(linkDraft(formatQuestionDraft(args, projectName), sessionID))
     } catch (error) {
       // A question notification must never prevent the tool from executing, even
       // if formatting or the logger fails.
@@ -616,14 +622,14 @@ export function createPluginHandlers(deps: HandlerDeps): PluginHandlers {
     }
   }
 
-  const onNotify = async (tool: string, args: unknown): Promise<void> => {
+  const onNotify = async (tool: string, args: unknown, sessionID?: string): Promise<void> => {
     if (disposed) return
     try {
       if (!config.events["agent.notify"]) return
       // Forward only the configured notify tool names. Explicit agent requests
       // are never suppressed, classified or deduplicated.
       if (!config.agentNotifyTools.includes(tool)) return
-      await send(formatAgentNotifyDraft(args, projectName))
+      await send(linkDraft(formatAgentNotifyDraft(args, projectName), sessionID))
     } catch (error) {
       safeLog(`notify handling failed: ${describeNtfyError(error)}`)
     }
